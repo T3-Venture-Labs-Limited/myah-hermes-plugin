@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myah-hermes-plugin"
+version = "1.1.0"
+description = "Myah platform connector for Hermes Agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+# Tier 2C §12 — version compatibility window.
+#
+# Pinning rationale: the plugin imports from gateway.run, gateway.platform_registry,
+# tools.approval, and similar paths that upstream considers internal — refactors
+# between hermes-agent minor versions can break the plugin silently. Pinning to a
+# single hermes minor version means a hermes 0.11 → 0.12 release does NOT silently
+# change plugin behavior; users see a pip resolver error and can either upgrade
+# the plugin or stay on the matching hermes version.
+#
+# When hermes-agent ships to PyPI, the dep below switches from undeclared
+# (Path B — git+https install in agent/Dockerfile.stock) to a strict semver
+# pin (Path A — `hermes-agent>=0.11,<0.12`). The plugin is 1.0.x as of
+# 2026-05-08; first release verified by Mode D against upstream commit
+# faa13e49f81480771ceeb55991bb0c27edf1a5fb (Hermes-Agent v0.11-track).
+#
+# OSS users today install via:
+#   pip install git+https://github.com/NousResearch/Hermes-Agent@<HERMES_SHA>
+#   pip install <plugin-source>
+# See CHANGELOG.md for the SHA verified against this plugin version.
+dependencies = [
+    "aiohttp>=3.9,<4",
+    # Pinned to upstream's faa13e49f (= Tier 2C base) until hermes-agent
+    # reaches PyPI. Users with a newer compatible install (e.g. main HEAD)
+    # won't conflict — pip respects already-installed compatible versions.
+    # When hermes-agent reaches PyPI, this becomes "hermes-agent>=0.11,<0.12".
+    # See CHANGELOG.md for the SHA verified against this plugin version.
+    "hermes-agent[messaging,cron,honcho,mcp,voice,pty,web] @ git+https://github.com/NousResearch/Hermes-Agent@faa13e49f81480771ceeb55991bb0c27edf1a5fb",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
+
+[project.entry-points."hermes_agent.plugins"]
+# Per Hermes plugin docs (website/docs/guides/build-a-hermes-plugin.md):
+# entry-point value is the MODULE path. Hermes' _load_entrypoint_module
+# returns ep.load() (the module), then getattr(module, "register") finds
+# the callback. Pointing at "module:function" returns the function
+# directly, which then fails Hermes' getattr(module, "register") check
+# with "no register() function".
+myah-platform = "myah_hermes_plugin.myah_platform"
+
+# Console script that materializes the myah-admin dashboard plugin's
+# filesystem-discovery hook at a Hermes-scanned location. Invoked from
+# agent/Dockerfile at image build time.
+[project.scripts]
+myah-hermes-plugin = "myah_hermes_plugin.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["myah_hermes_plugin", "myah_hermes_plugin.*"]
+
+# Ship manifest.json inside the wheel so the install CLI can copy it from
+# package data via ``importlib.resources.files``. The Python sub-router
+# source files (_common.py, _providers.py, etc.) are regular package
+# modules and are already included by ``packages.find`` — they do not
+# need a package-data entry.
+[tool.setuptools.package-data]
+"myah_hermes_plugin.myah_admin.dashboard" = ["manifest.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

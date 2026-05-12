@@ -1,0 +1,10 @@
+{
+  "name": "myah-admin",
+  "label": "Myah Admin",
+  "description": "Myah platform admin endpoints exposed inside the per-user Hermes container.",
+  "version": "1.0.0",
+  "icon": "Settings",
+  "tab": null,
+  "entry": null,
+  "api": "plugin_api.py"
+}
