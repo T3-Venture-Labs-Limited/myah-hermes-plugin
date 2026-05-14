@@ -1,0 +1,28 @@
+# Hermes plugin manifest.
+#
+# This file is required for `hermes plugins install <owner>/<repo>` to
+# recognize this directory as a plugin and load it on hermes startup.
+# Upstream loader: hermes_cli/plugins_cmd.py:347 (reads manifest) +
+# plugins.py:826 (manifest discovery).
+
+manifest_version: 1
+name: myah
+version: 1.1.0
+
+description: |
+  Myah platform adapter for Hermes Agent. Installs the Myah platform
+  integration so a separately-running Myah web frontend (https://myah.dev)
+  can connect to your local hermes-agent instance.
+
+  The plugin exposes:
+  - The `myah` platform via ctx.register_platform(...) — the canonical
+    integration surface for any UI that wants to render Hermes runs.
+  - `/myah/*` HTTP routes inside the hermes gateway (chat, health,
+    secrets, runtime-admin).
+  - A `hermes-myah` toolset that gives the agent runtime access to
+    Myah-specific facilities.
+
+author: T3 Venture Labs Limited
+homepage: https://myah.dev
+repository: https://github.com/T3-Venture-Labs-Limited/myah-hermes-plugin
+license: MIT
