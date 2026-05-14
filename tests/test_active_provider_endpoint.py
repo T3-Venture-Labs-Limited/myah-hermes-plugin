@@ -11,7 +11,7 @@ flow (API-key save, OAuth complete, manual switch) without hermes-core changes.
 """
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
@@ -29,11 +29,15 @@ def _make_request(body: dict, headers: dict | None = None):
 
 
 def _make_adapter(auth_key: str = ''):
-    """Construct a MyahAdapter with register_pre_setup_hook mocked out."""
+    """Construct a MyahAdapter.
+
+    Tier 2A Task 2A.3 retired the dependency on
+    ``gateway.platforms.api_server.register_pre_setup_hook``; the
+    adapter now owns its own aiohttp runner.
+    """
     from gateway.config import PlatformConfig
-    with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': auth_key}))
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': auth_key}))
 
 
 def _seed_auth_store(credential_pool: dict, active_provider: str | None = None,

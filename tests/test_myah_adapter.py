@@ -12,7 +12,7 @@ Tests cover:
 
 import asyncio
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from gateway.config import Platform, PlatformConfig
 
@@ -20,15 +20,23 @@ from gateway.config import Platform, PlatformConfig
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _make_adapter(auth_key: str = "", **extra_kwargs):
-    """Construct a MyahAdapter with register_pre_setup_hook mocked out."""
+    """Construct a MyahAdapter.
+
+    Tier 2A Task 2A.3 (see ``myah_platform/standalone_runner.py``) retired
+    the adapter's dependency on ``gateway.platforms.api_server.register_pre_setup_hook``
+    — the adapter now owns its own aiohttp ``AppRunner`` via
+    ``MyahStandaloneRunner``. Older revisions of this helper patched the
+    upstream symbol to keep adapter ``__init__`` side-effect free; that
+    patch is now both unnecessary and impossible (the symbol no longer
+    exists in upstream), so we just build the adapter directly.
+    """
     extra = dict(extra_kwargs)
     if auth_key:
         extra["auth_key"] = auth_key
     config = PlatformConfig(enabled=True, extra=extra)
 
-    with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        return MyahAdapter(config)
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    return MyahAdapter(config)
 
 
 # ── check_myah_requirements ─────────────────────────────────────────────────

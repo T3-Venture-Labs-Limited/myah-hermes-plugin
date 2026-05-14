@@ -125,19 +125,23 @@ class TestPluginRegistersMyahPlatform:
     def test_adapter_factory_constructible(
         self, captured_registration: _RecordingContext
     ) -> None:
-        """adapter_factory must produce a MyahAdapter instance from a PlatformConfig."""
+        """adapter_factory must produce a MyahAdapter instance from a PlatformConfig.
+
+        Tier 2A Task 2A.3 (see ``myah_platform/standalone_runner.py``)
+        retired the adapter's dependency on
+        ``gateway.platforms.api_server.register_pre_setup_hook``: the
+        adapter now owns its own aiohttp ``AppRunner`` via
+        ``MyahStandaloneRunner``. The factory call therefore has no
+        side effects on upstream's api_server module and no patching
+        is required.
+        """
         from gateway.config import PlatformConfig
 
         entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
         factory = entry.get("adapter_factory")
         assert callable(factory)
 
-        # The adapter registers a pre-setup hook on api_server during
-        # __init__; patch it out to keep the unit test side-effect free.
-        from unittest.mock import patch
-
-        with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-            adapter = factory(PlatformConfig(enabled=True, extra={}))
+        adapter = factory(PlatformConfig(enabled=True, extra={}))
         from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
 
         assert isinstance(adapter, MyahAdapter)
@@ -167,41 +171,35 @@ class TestImportability:
             __import__("gateway.platforms.myah", fromlist=["MyahAdapter"])
 
 
-# ── Toolset preset (Item 7 from old contract — still applies) ─────────────
-
-
-def test_hermes_myah_toolset_preset_exists() -> None:
-    """``toolsets.py::TOOLSETS`` registers the ``hermes-myah`` preset.
-
-    This entry stays in core because the toolset preset is consumed by
-    other Hermes machinery (CLI tools menu, gateway tools config) before
-    plugins have registered. Phase 4f will revisit whether the preset
-    should also move to the plugin.
-    """
-    from toolsets import TOOLSETS
-
-    assert "hermes-myah" in TOOLSETS, (
-        "TOOLSETS must include a 'hermes-myah' preset for the Myah platform"
-    )
-
-
-# ── Cronjob deliver schema mention (description-only, still applies) ──────
-
-
-def test_myah_in_cronjob_deliver_schema() -> None:
-    """``cronjob_tools.py`` deliver-parameter description still mentions myah.
-
-    The schema description teaches the model how to address Myah chats
-    (``myah:<chat_id>:<thread_id>``); even with the platform extracted
-    to a plugin, this guidance text remains in core because it's part
-    of the generic deliver-target syntax.
-    """
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parents[3] / "tools" / "cronjob_tools.py").read_text(
-        encoding="utf-8"
-    )
-    assert "myah" in src.lower(), "cronjob deliver schema must mention myah"
+# ── Removed: upstream-toolset-preset and cronjob-deliver-schema tests ─────
+#
+# Two contract tests previously enforced invariants on upstream Hermes
+# core that no longer hold at the pinned ``HERMES_SHA``:
+#
+# * ``test_hermes_myah_toolset_preset_exists`` — asserted that upstream's
+#   ``toolsets.TOOLSETS`` dict contained a ``"hermes-myah"`` preset. Its
+#   own docstring flagged Phase 4f as the point at which the preset
+#   would migrate to the plugin; that move has happened upstream, so the
+#   preset is gone from core. The plugin's own ``default_toolset =
+#   "hermes-myah"`` wiring (via ``hermes_cli.tools_config.PLATFORMS``)
+#   is asserted from the right angle by
+#   ``test_myah_platform_bridge.py::test_register_bridges_into_tools_config_platforms``.
+#
+# * ``test_myah_in_cronjob_deliver_schema`` — read upstream's
+#   ``tools/cronjob_tools.py`` via ``Path(__file__).resolve().parents[3]``
+#   and asserted ``"myah"`` appeared in the deliver-target description.
+#   Two things broke: upstream no longer mentions myah in
+#   ``cronjob_tools.py`` (the platform-specific guidance moved out of
+#   the generic deliver-target docs), and in Mode D the plugin source
+#   lives at ``/opt/myah-plugin-source`` so ``parents[3]`` resolves to
+#   ``/`` rather than the hermes checkout. The test failed with
+#   ``FileNotFoundError`` regardless of upstream content.
+#
+# Both tests were enforcing the wrong contract from the wrong location;
+# deleting them removes the false signal without losing any real
+# protection. The model's understanding of the ``myah:<chat>:<thread>``
+# deliver-target shape is now seeded from the plugin's own platform
+# entry rather than from upstream cron schema strings.
 
 
 if __name__ == "__main__":

@@ -44,12 +44,14 @@ class _FakeRunner:
 
 
 def _make_adapter_with_runner():
+    # Tier 2A Task 2A.3 removed the dependency on
+    # ``gateway.platforms.api_server.register_pre_setup_hook``; build the
+    # adapter directly.
     from gateway.config import PlatformConfig
 
-    with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
 
-        adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
     runner = _FakeRunner()
     adapter.gateway_runner = runner
     return adapter, runner

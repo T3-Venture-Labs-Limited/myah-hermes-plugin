@@ -18,14 +18,18 @@ PDF_BYTES = b'%PDF-1.4\n' + b'\x00' * 100
 
 
 def _make_adapter():
-    """Build a MyahAdapter with minimal config and pre-setup hook mocked out."""
+    """Build a MyahAdapter with minimal config.
+
+    Tier 2A Task 2A.3 removed the adapter's dependency on
+    ``gateway.platforms.api_server.register_pre_setup_hook``, so we
+    construct the adapter directly without patching the upstream symbol.
+    """
     config = PlatformConfig(
         enabled=True,
         extra={'auth_key': 'test-bearer'},
     )
-    with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        adapter = MyahAdapter(config)
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    adapter = MyahAdapter(config)
 
     # Mark as connected so _handle_message_endpoint doesn't bail on stream limits
     adapter._running = True

@@ -45,13 +45,19 @@ _JOB_NAME = "test-cron-job"
 
 
 def _make_adapter(auth_key: str = ""):
+    """Construct a MyahAdapter.
+
+    After Tier 2A Task 2A.3 the adapter owns its own aiohttp runner
+    (``MyahStandaloneRunner``) and no longer depends on
+    ``gateway.platforms.api_server.register_pre_setup_hook``, so the
+    helper just builds the adapter directly.
+    """
     extra = dict()
     if auth_key:
         extra["auth_key"] = auth_key
     config = PlatformConfig(enabled=True, extra=extra)
-    with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        return MyahAdapter(config)
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    return MyahAdapter(config)
 
 
 class _RecordingResponse:

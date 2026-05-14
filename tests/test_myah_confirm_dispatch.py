@@ -30,13 +30,18 @@ from gateway.config import PlatformConfig
 
 
 def _make_adapter(auth_key: str = ""):
+    """Construct a MyahAdapter.
+
+    Tier 2A Task 2A.3 removed the dependency on
+    ``gateway.platforms.api_server.register_pre_setup_hook``; the
+    adapter now owns its own aiohttp runner.
+    """
     extra = dict()
     if auth_key:
         extra["auth_key"] = auth_key
     config = PlatformConfig(enabled=True, extra=extra)
-    with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        return MyahAdapter(config)
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    return MyahAdapter(config)
 
 
 def _make_app(adapter) -> web.Application:

@@ -34,11 +34,15 @@ class _FakeRunner:
 
 
 def _make_adapter_with_runner(initial_override: dict | None = None):
-    """Construct a MyahAdapter wired to a _FakeRunner."""
+    """Construct a MyahAdapter wired to a _FakeRunner.
+
+    Tier 2A Task 2A.3 retired the dependency on
+    ``gateway.platforms.api_server.register_pre_setup_hook``; the adapter
+    now owns its own aiohttp runner.
+    """
     from gateway.config import PlatformConfig
-    with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
     runner = _FakeRunner()
     adapter.gateway_runner = runner
     if initial_override is not None:

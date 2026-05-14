@@ -1,7 +1,7 @@
 """Tests for POST /myah/v1/aux/{task} — HTTP wrapper for auxiliary_client.call_llm."""
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
@@ -19,11 +19,15 @@ def _make_aux_request(task: str, body: dict):
 
 
 def _make_adapter():
-    """Construct a MyahAdapter with register_pre_setup_hook mocked out."""
+    """Construct a MyahAdapter.
+
+    Tier 2A Task 2A.3 retired the dependency on
+    ``gateway.platforms.api_server.register_pre_setup_hook``; the
+    adapter now owns its own aiohttp runner, so no patching needed.
+    """
     from gateway.config import PlatformConfig
-    with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-        return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
+    return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
 
 
 @pytest.fixture(autouse=True)
