@@ -89,6 +89,43 @@ def check_myah_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+# ── Myah: plugin version source ────────────────────────────────────────────
+# The platform's OSS first-run probe (D4 in vm-testing-followups.md) reads
+# this via ``GET /myah/health`` to surface plugin-version diagnostics.
+#
+# Source-of-truth ordering:
+#   1. ``importlib.metadata.version('myah-hermes-plugin')`` — what pip
+#      actually installed. Always matches ``pyproject.toml``'s
+#      ``[project] version`` (1.1.0 today).
+#   2. ``myah_hermes_plugin.__version__`` — fallback when metadata is
+#      missing (editable install with no wheel built yet). Currently
+#      ``0.3.0`` — diverges from pyproject. Aligning the three sources
+#      (``pyproject.toml`` / ``plugin.yaml`` / ``__init__.__version__``)
+#      is a plugin-release-process decision and intentionally out-of-scope
+#      for this fix; the health endpoint just reports what's actually
+#      loaded.
+#   3. ``"unknown"`` — last-ditch safety, never None (the platform probe
+#      uses ``r.json().get("version")`` so None would round-trip back to
+#      the regression we're fixing).
+def _plugin_version() -> str:
+    """Return the running plugin's version string."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version as _v
+        return _v('myah-hermes-plugin')
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+    try:
+        from myah_hermes_plugin import __version__ as _v
+        if _v:
+            return str(_v)
+    except Exception:
+        pass
+    return 'unknown'
+# ────────────────────────────────────────────────────────────────────────────
+
+
 # ── Myah: mime/extension helper ────────────────────────────────────────────
 def _myah_ext(mime: str, filename: str, default: str) -> str:
     """Return a file extension (with leading dot) from MIME, filename, or default."""
@@ -345,11 +382,28 @@ class MyahAdapter(BasePlatformAdapter):
     # ── HTTP endpoint handlers ──────────────────────────────────────────
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /myah/health — health check."""
+        """GET /myah/health — health check.
+
+        Includes the plugin's installed version so the platform's OSS
+        first-run probe (D4 in docs/oss-launch/vm-testing-followups.md)
+        can surface a "plugin too old" diagnostic instead of an opaque
+        ``plugin_version: null``. The version is resolved from the
+        installed wheel's metadata via ``importlib.metadata`` — this is
+        the same source ``pip show`` reads, so it always matches what
+        pip actually installed (currently ``1.1.0`` per ``pyproject.toml``).
+
+        Falls back to ``myah_hermes_plugin.__version__`` if metadata is
+        missing (editable install with no wheel built yet). Note that
+        ``plugin.yaml`` and ``__init__.py`` may disagree in the source
+        tree — version-string alignment is a release-process concern,
+        not something this endpoint can fix; we report whatever the
+        running interpreter actually loaded.
+        """
         return web.json_response({
             "status": "ok" if self._running else "disconnected",
             "platform": "myah",
             "streams_active": len(self._streams),
+            "version": _plugin_version(),
         })
 
     async def _handle_message_endpoint(self, request: "web.Request") -> "web.Response":
