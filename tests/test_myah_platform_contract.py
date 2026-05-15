@@ -108,7 +108,7 @@ class TestPluginRegistersMyahPlatform:
 
         If this assertion ever fails, the platform-side companion test
         test_container_env_includes_myah_home_chat_disabled in
-        platform/backend/open_webui/test/apps/myah/routers/test_containers.py
+        platform-oss/backend/myah/test/apps/myah/routers/test_containers.py
         must be updated in lockstep, otherwise the "📬 No home channel is set"
         warning will resurface on every fresh chat in production.
         """

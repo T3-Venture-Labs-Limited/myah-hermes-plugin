@@ -3,7 +3,7 @@
 Mounted at ``/api/plugins/myah-admin/`` by the dashboard plugin loader inside
 each per-user Hermes container. The platform backend reaches these routes
 through the loopback ``hermes dashboard`` server (port 9119) using the
-per-container session token (see ``platform/backend/open_webui/utils/hermes_web.py``).
+per-container session token (see ``platform-oss/backend/myah/utils/hermes_web.py``).
 
 What this plugin owns:
     Every Myah-specific admin operation that does NOT require live

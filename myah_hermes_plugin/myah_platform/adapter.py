@@ -2118,7 +2118,7 @@ class MyahAdapter(BasePlatformAdapter):
         module-level cache at the top of this file is used by the
         attachment-fetch path which has different startup ordering).
 
-        Payload shape pinned by ``platform/backend/open_webui/routers/
+        Payload shape pinned by ``platform-oss/backend/myah/routers/
         processes.py:824-831`` (the ``/webhook/run-complete`` handler).
 
         **Only fires for cron deliveries.**  The platform's webhook
