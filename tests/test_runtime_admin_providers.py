@@ -18,6 +18,12 @@ from aiohttp.test_utils import make_mocked_request
 
 from myah_hermes_plugin.myah_platform.runtime_admin import _make_handlers
 
+# Shared across every test in this file. Real auth_key + matching Bearer
+# header so each business-logic test exercises a real authed request path.
+# A separate test class below covers the empty-auth-key fail-closed path.
+_TEST_AUTH_KEY = "runtime-admin-provider-tests-bearer"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 @pytest.fixture
 def fake_runner():
@@ -85,8 +91,8 @@ async def test_providers_lists_env_var_credentialed(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=fake_catalog,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     assert resp.status == 200
@@ -116,8 +122,8 @@ async def test_providers_lists_oauth_credentialed_via_auth_json(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=fake_catalog,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     body = json.loads(resp.body.decode())
@@ -152,8 +158,8 @@ async def test_providers_lists_credentialed_via_credential_pool(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=fake_catalog,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     body = json.loads(resp.body.decode())
@@ -175,8 +181,8 @@ async def test_providers_lists_empty_when_no_creds(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=fake_catalog,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     body = json.loads(resp.body.decode())
@@ -195,8 +201,8 @@ async def test_providers_returns_required_fields(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=fake_catalog,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     body = json.loads(resp.body.decode())
@@ -220,8 +226,8 @@ async def test_providers_handles_catalog_failure_gracefully(
         "myah_hermes_plugin.myah_admin.dashboard._providers._build_catalog",
         new=_explode,
     ):
-        handlers = _make_handlers(fake_runner, auth_key="")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
 
     assert resp.status == 200
@@ -239,7 +245,7 @@ async def test_providers_requires_auth_when_key_set(
         new=fake_catalog,
     ):
         handlers = _make_handlers(fake_runner, auth_key="secret-key")
-        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        req = make_mocked_request("GET", "/myah/v1/admin/providers", headers=_AUTHED_HEADERS)
         resp = await handlers["get_provider_catalog"](req)
         assert resp.status == 401
 
@@ -249,3 +255,68 @@ async def test_providers_requires_auth_when_key_set(
         )
         resp = await handlers["get_provider_catalog"](req)
         assert resp.status == 200
+
+
+# ── Fail-closed when MYAH_ADAPTER_AUTH_KEY is unset ────────────────────────
+
+
+class TestRuntimeAdminAuthFailsClosed:
+    """The runtime admin endpoints (/myah/v1/admin/*) are the privileged
+    surface of the plugin. Before this fix, passing ``auth_key=""``
+    (which is what happens when MYAH_ADAPTER_AUTH_KEY is unset in
+    ~/.hermes/.env) made every handler bypass auth — anyone on
+    MYAH_GATEWAY_PORT could read providers, write secrets, swap models,
+    and manage sessions without credentials.
+
+    These tests pin the new fail-closed behaviour: handlers must refuse
+    requests with 503 + an actionable error pointing at
+    ``scripts/setup-myah-oss.sh``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_provider_catalog_refuses_when_auth_key_empty(
+        self, fake_runner
+    ):
+        handlers = _make_handlers(fake_runner, auth_key="")
+        req = make_mocked_request(
+            "GET",
+            "/myah/v1/admin/providers",
+            headers={"Authorization": "Bearer anything"},
+        )
+        resp = await handlers["get_provider_catalog"](req)
+        assert resp.status == 503
+        body = json.loads(resp.body.decode())
+        assert "MYAH_ADAPTER_AUTH_KEY" in body.get("detail", "")
+        assert "setup-myah-oss.sh" in body.get("detail", "")
+
+    @pytest.mark.asyncio
+    async def test_get_provider_catalog_refuses_when_auth_key_none(
+        self, fake_runner
+    ):
+        handlers = _make_handlers(fake_runner, auth_key=None)
+        req = make_mocked_request("GET", "/myah/v1/admin/providers")
+        resp = await handlers["get_provider_catalog"](req)
+        assert resp.status == 503
+
+    @pytest.mark.asyncio
+    async def test_other_admin_handlers_also_fail_closed(self, fake_runner):
+        """Spot-check that the fail-closed behaviour applies to every
+        runtime-admin handler, not just the providers one."""
+        handlers = _make_handlers(fake_runner, auth_key="")
+        for name in (
+            "get_session_override",
+            "post_session_override",
+            "get_config",
+            "post_config",
+            "get_active_provider",
+            "post_active_provider",
+        ):
+            handler = handlers.get(name)
+            if handler is None:
+                continue  # handler may be renamed; tolerate
+            req = make_mocked_request("GET", f"/myah/v1/admin/{name}")
+            resp = await handler(req)
+            assert resp.status == 503, (
+                f"handler {name!r} did not fail closed with empty auth_key "
+                f"(got status {resp.status})"
+            )

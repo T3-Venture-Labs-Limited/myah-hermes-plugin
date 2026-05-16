@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_allowed_media_roots"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 
 def _make_adapter():

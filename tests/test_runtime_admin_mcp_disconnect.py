@@ -34,6 +34,12 @@ from aiohttp.test_utils import make_mocked_request
 
 from myah_hermes_plugin.myah_platform.runtime_admin import _make_handlers
 
+# Runtime admin handlers fail closed when auth_key is empty (a fix to
+# the silent-allow-all bug). Tests that exercise business logic must
+# pass a real auth_key + matching Bearer header.
+_TEST_AUTH_KEY = "runtime-admin-mcp-tests-bearer"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 @pytest.fixture
 def fake_runner():
@@ -66,11 +72,8 @@ async def test_disconnect_mcp_runs_real_disconnect_path(fake_runner, monkeypatch
     monkeypatch.setattr(mcp_tool, '_lock', threading.Lock(), raising=False)
     monkeypatch.setattr(mcp_tool, '_run_on_mcp_loop', fake_run_on_loop, raising=False)
 
-    handlers = _make_handlers(fake_runner, auth_key='')
-    req = make_mocked_request(
-        'POST',
-        '/myah/v1/admin/mcp/disconnect/my-mcp',
-        match_info={'name': 'my-mcp'},
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request('POST', '/myah/v1/admin/mcp/disconnect/my-mcp', headers=_AUTHED_HEADERS, match_info={'name': 'my-mcp'},
     )
 
     resp = await handlers['disconnect_mcp'](req)
@@ -110,11 +113,8 @@ async def test_disconnect_mcp_no_such_server_still_returns_ok(fake_runner, monke
         mcp_tool, '_run_on_mcp_loop', lambda c, timeout=15: None, raising=False
     )
 
-    handlers = _make_handlers(fake_runner, auth_key='')
-    req = make_mocked_request(
-        'POST',
-        '/myah/v1/admin/mcp/disconnect/ghost',
-        match_info={'name': 'ghost'},
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request('POST', '/myah/v1/admin/mcp/disconnect/ghost', headers=_AUTHED_HEADERS, match_info={'name': 'ghost'},
     )
 
     resp = await handlers['disconnect_mcp'](req)

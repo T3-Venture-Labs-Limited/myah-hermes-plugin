@@ -6,13 +6,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_aux_endpoint"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 def _make_aux_request(task: str, body: dict):
     """Build a mocked request for /myah/v1/aux/{task}."""
-    request = make_mocked_request(
-        'POST',
-        f'/myah/v1/aux/{task}',
-        match_info={'task': task},
+    request = make_mocked_request('POST', f'/myah/v1/aux/{task}', headers=_AUTHED_HEADERS, match_info={'task': task},
     )
     request.json = AsyncMock(return_value=body)
     return request
@@ -27,7 +29,7 @@ def _make_adapter():
     """
     from gateway.config import PlatformConfig
     from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
-    return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': _TEST_AUTH_KEY}))
 
 
 @pytest.fixture(autouse=True)

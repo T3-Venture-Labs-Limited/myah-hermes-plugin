@@ -70,9 +70,46 @@ logger = logging.getLogger(__name__)
 def _check_auth(
     request: "web.Request", auth_key: Optional[str]
 ) -> Optional["web.Response"]:
-    """Same Bearer-token model as MyahAdapter._check_auth."""
+    """Same Bearer-token model as MyahAdapter._check_auth — fails closed.
+
+    Three states:
+
+    - ``auth_key`` is None / empty → return 503 with actionable error.
+      Previously this returned ``None`` ("allow all"), which combined
+      with the adapter's identical bug to make every
+      ``/myah/v1/admin/*`` endpoint (providers, secrets, runtime config,
+      sessions, MCP server CRUD, ...) reachable without credentials
+      whenever ``MYAH_ADAPTER_AUTH_KEY`` was unset. The adapter side
+      was fixed in this PR's ``adapter.py:_check_auth`` — fixing only
+      one side leaves the same open-relay path here, since the runtime
+      admin routes (the more dangerous half) use this helper not the
+      adapter's.
+
+    - Bearer token present + matches ``auth_key`` → return ``None``
+      (auth passed; handler continues).
+
+    - Anything else (wrong token, missing header, non-Bearer scheme) →
+      401.
+
+    Like the adapter side, ``/myah/health`` skips this gate entirely
+    so the platform's OSS first-run probe can still surface a useful
+    diagnostic when the bearer isn't set — but runtime-admin endpoints
+    are the actual privileged surface, so they must enforce auth even
+    when the operator hasn't wired the bearer yet.
+    """
     if not auth_key:
-        return None
+        return web.json_response(
+            {
+                "error": "Myah plugin auth not configured",
+                "detail": (
+                    "MYAH_ADAPTER_AUTH_KEY is unset in ~/.hermes/.env. "
+                    "Run scripts/setup-myah-oss.sh in your Myah platform "
+                    "clone to generate one and sync it to both sides, "
+                    "then restart hermes."
+                ),
+            },
+            status=503,
+        )
     header = request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         token = header[7:].strip()

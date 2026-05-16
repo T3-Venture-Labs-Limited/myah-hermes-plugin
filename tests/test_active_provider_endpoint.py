@@ -16,19 +16,24 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_active_provider_endpoint"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 def _make_request(body: dict, headers: dict | None = None):
     """Build a mocked request for /myah/v1/active-provider."""
     request = make_mocked_request(
         'POST',
         '/myah/v1/active-provider',
-        headers=headers or {},
+        headers=headers if headers is not None else _AUTHED_HEADERS,
     )
     request.json = AsyncMock(return_value=body)
     return request
 
 
-def _make_adapter(auth_key: str = ''):
+def _make_adapter(auth_key: str = _TEST_AUTH_KEY):
     """Construct a MyahAdapter.
 
     Tier 2A Task 2A.3 retired the dependency on
