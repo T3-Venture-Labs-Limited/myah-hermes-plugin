@@ -11,6 +11,11 @@ import pytest
 
 from gateway.config import PlatformConfig
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_platform_media"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 JPEG_BYTES = b'\xff\xd8\xff\xe0\x00\x10JFIF' + b'\x00' * 100
 MP3_BYTES = b'ID3\x04\x00\x00' + b'\x00' * 100

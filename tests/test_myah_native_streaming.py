@@ -26,6 +26,11 @@ from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_native_streaming"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 class NativeStreamingAdapter(BasePlatformAdapter):
     """Mock adapter mirroring Myah's structured-callback streaming pattern."""

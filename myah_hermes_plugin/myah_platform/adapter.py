@@ -326,9 +326,42 @@ class MyahAdapter(BasePlatformAdapter):
     # ── Auth ────────────────────────────────────────────────────────────
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
-        """Validate Bearer token. Returns None if OK, 401 response on failure."""
+        """Validate Bearer token. Returns None if OK, an error response otherwise.
+
+        Three states:
+
+        - ``_auth_key`` is unset → return 503 with an actionable error message.
+          Previously this returned ``None`` ("allow all"), which silently
+          turned every authed endpoint into an open relay. Anyone who
+          could reach the adapter's port (``MYAH_GATEWAY_PORT``, default
+          8643) could call ``/myah/v1/admin/*`` without credentials.
+          Fail-closed is correct: the routes still bind so platform-side
+          probes can see ``plugin_installed=true``, but no admin or chat
+          surface is reachable until the operator wires the bearer token.
+
+        - Bearer token present + matches ``_auth_key`` → return ``None``
+          (auth passed; handler continues).
+
+        - Anything else (wrong token, missing header, non-Bearer scheme) →
+          return 401.
+
+        ``/myah/health`` is registered without going through this gate so
+        the platform's OSS first-run probe can still surface a useful
+        diagnostic when the bearer isn't set.
+        """
         if not self._auth_key:
-            return None  # No key configured — allow all
+            return web.json_response(
+                {
+                    "error": "Myah plugin auth not configured",
+                    "detail": (
+                        "MYAH_ADAPTER_AUTH_KEY is unset in ~/.hermes/.env. "
+                        "Run scripts/setup-myah-oss.sh in your Myah platform "
+                        "clone to generate one and sync it to both sides, "
+                        "then restart hermes."
+                    ),
+                },
+                status=503,
+            )
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):

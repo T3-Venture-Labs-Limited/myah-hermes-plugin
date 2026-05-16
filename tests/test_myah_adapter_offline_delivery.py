@@ -35,6 +35,11 @@ import pytest
 
 from gateway.config import PlatformConfig
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_adapter_offline_delivery"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 _PLATFORM_BASE_URL = "http://platform:8081"
 _PLATFORM_BEARER = "test-bearer-xyz"
@@ -44,7 +49,7 @@ _JOB_ID = "job-deadbeef"
 _JOB_NAME = "test-cron-job"
 
 
-def _make_adapter(auth_key: str = ""):
+def _make_adapter(auth_key: str = _TEST_AUTH_KEY):
     """Construct a MyahAdapter.
 
     After Tier 2A Task 2A.3 the adapter owns its own aiohttp runner

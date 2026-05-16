@@ -16,6 +16,12 @@ from aiohttp.test_utils import make_mocked_request
 
 from myah_hermes_plugin.myah_platform.runtime_admin import _make_handlers
 
+# Shared real auth_key + Bearer header — the runtime admin handlers now
+# fail closed when auth_key is empty, so business-logic tests must use
+# a real key. A dedicated test covers the fail-closed path.
+_TEST_AUTH_KEY = "runtime-admin-config-tests-bearer"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 @pytest.fixture
 def fake_runner():
@@ -47,8 +53,8 @@ async def test_config_returns_model_block(hermes_home, fake_runner):
     }
     (hermes_home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
-    handlers = _make_handlers(fake_runner, auth_key="")
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
 
     assert resp.status == 200
@@ -69,8 +75,8 @@ async def test_config_returns_model_block(hermes_home, fake_runner):
 @pytest.mark.asyncio
 async def test_config_missing_file_returns_empty(hermes_home, fake_runner):
     """No config.yaml → return {model: {}} with status 200, don't error."""
-    handlers = _make_handlers(fake_runner, auth_key="")
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
 
     assert resp.status == 200
@@ -83,8 +89,8 @@ async def test_config_missing_file_returns_empty(hermes_home, fake_runner):
 async def test_config_missing_model_block_returns_empty(hermes_home, fake_runner):
     """config.yaml exists but no model section → {model: {}}."""
     (hermes_home / "config.yaml").write_text(yaml.safe_dump({"agent": {"max_turns": 100}}))
-    handlers = _make_handlers(fake_runner, auth_key="")
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
 
     assert resp.status == 200
@@ -97,8 +103,8 @@ async def test_config_missing_model_block_returns_empty(hermes_home, fake_runner
 async def test_config_invalid_yaml_returns_empty(hermes_home, fake_runner):
     """Malformed YAML → degrade gracefully, return empty."""
     (hermes_home / "config.yaml").write_text("model:\n  default: [unclosed list\n")
-    handlers = _make_handlers(fake_runner, auth_key="")
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
 
     assert resp.status == 200
@@ -117,8 +123,8 @@ async def test_config_partial_model_block(hermes_home, fake_runner):
     cfg = {"model": {"provider": "openrouter", "default": "moonshotai/kimi-k2.6"}}
     (hermes_home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
-    handlers = _make_handlers(fake_runner, auth_key="")
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    handlers = _make_handlers(fake_runner, auth_key=_TEST_AUTH_KEY)
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
 
     import json
@@ -136,7 +142,7 @@ async def test_config_requires_auth_when_key_set(hermes_home, fake_runner):
     handlers = _make_handlers(fake_runner, auth_key="secret-key-abc")
 
     # No Authorization header → 401
-    req = make_mocked_request("GET", "/myah/v1/admin/config")
+    req = make_mocked_request("GET", "/myah/v1/admin/config", headers=_AUTHED_HEADERS)
     resp = await handlers["get_hermes_config"](req)
     assert resp.status == 401
 
@@ -158,11 +164,20 @@ async def test_config_requires_auth_when_key_set(hermes_home, fake_runner):
 
 
 @pytest.mark.asyncio
-async def test_config_no_auth_when_key_empty(hermes_home, fake_runner):
-    """OSS single-tenant: auth_key='' means accept all requests."""
+async def test_config_fails_closed_when_auth_key_empty(hermes_home, fake_runner):
+    """OSS install with MYAH_ADAPTER_AUTH_KEY unset must NOT serve config.
+
+    Previously this test asserted the opposite — auth_key='' meant 'accept
+    all requests', which combined with the parallel adapter bug to leave
+    every /myah/v1/admin/* endpoint reachable without credentials. The
+    fix-closed behaviour is verified here.
+    """
     (hermes_home / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "x"}}))
     handlers = _make_handlers(fake_runner, auth_key="")
 
     req = make_mocked_request("GET", "/myah/v1/admin/config")
     resp = await handlers["get_hermes_config"](req)
-    assert resp.status == 200
+    assert resp.status == 503
+    import json as _json
+    body = _json.loads(resp.body.decode())
+    assert "MYAH_ADAPTER_AUTH_KEY" in body.get("detail", "")

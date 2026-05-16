@@ -75,12 +75,35 @@ class TestMyahAdapterInit:
 
 
 class TestMyahAdapterAuth:
-    def test_no_key_configured_allows_all(self):
-        """No auth key configured — all requests pass (returns None)."""
+    def test_no_key_configured_fails_closed(self):
+        """No auth key configured — returns 503 with actionable error.
+
+        Previously this returned ``None`` ("allow all") which was a silent
+        security footgun: anyone who could reach the adapter's port could
+        call ``/myah/v1/admin/*`` without credentials. The new behavior
+        keeps the routes bound (so platform probes still see the plugin)
+        but refuses every authed request until the operator wires the
+        bearer token via ``scripts/setup-myah-oss.sh``.
+        """
+        adapter = _make_adapter()
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer anything-at-all"}
+        result = adapter._check_auth(request)
+        assert result is not None
+        assert result.status == 503
+
+    def test_no_key_configured_fail_closed_message_is_actionable(self):
+        """The 503 body names the env var and the remediation script."""
+        import json as _json
         adapter = _make_adapter()
         request = MagicMock()
         request.headers = {}
-        assert adapter._check_auth(request) is None
+        result = adapter._check_auth(request)
+        assert result is not None
+        assert result.status == 503
+        body = _json.loads(result.body.decode("utf-8"))
+        assert "MYAH_ADAPTER_AUTH_KEY" in body.get("detail", "")
+        assert "setup-myah-oss.sh" in body.get("detail", "")
 
     def test_valid_bearer_token(self):
         """Valid bearer token — returns None (success)."""

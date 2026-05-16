@@ -29,6 +29,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
+# Adapter now fails closed when auth_key is empty.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_adapter_chat_active_provider_sync"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
+
 
 class _FakeRunner:
     """Minimal runner stand-in tracking session-override state."""
@@ -51,7 +55,7 @@ def _make_adapter_with_runner():
 
     from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
 
-    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': _TEST_AUTH_KEY}))
     runner = _FakeRunner()
     adapter.gateway_runner = runner
     return adapter, runner
@@ -92,7 +96,7 @@ def fake_switch_to_codex():
 
 
 def _make_message_request(body: dict):
-    request = make_mocked_request('POST', '/myah/v1/message')
+    request = make_mocked_request('POST', '/myah/v1/message', headers=_AUTHED_HEADERS)
     request.json = AsyncMock(return_value=body)
     return request
 

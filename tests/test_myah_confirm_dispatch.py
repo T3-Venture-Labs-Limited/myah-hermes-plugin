@@ -28,8 +28,13 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 
+# Adapter and runtime-admin now fail closed when auth_key is empty.
+# Tests must construct adapters with a real auth_key and authed headers.
+_TEST_AUTH_KEY = "test-bearer-key-for-test_myah_confirm_dispatch"
+_AUTHED_HEADERS = {"Authorization": f"Bearer {_TEST_AUTH_KEY}"}
 
-def _make_adapter(auth_key: str = ""):
+
+def _make_adapter(auth_key: str = _TEST_AUTH_KEY):
     """Construct a MyahAdapter.
 
     Tier 2A Task 2A.3 removed the dependency on
@@ -68,7 +73,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
-                    json={"confirmation_id": "conf-xyz", "choice": "approve"},
+                    json={"confirmation_id": "conf-xyz", "choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
@@ -96,7 +101,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
-                    json={"choice": "approve"},
+                    json={"choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
@@ -121,7 +126,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
-                    json={"choice": "approve"},
+                    json={"choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
@@ -142,7 +147,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
-                    json={"confirmation_id": "missing", "choice": "approve"},
+                    json={"confirmation_id": "missing", "choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
@@ -160,7 +165,7 @@ class TestConfirmEndpointActionDispatch:
         async with TestClient(TestServer(_make_app(adapter))) as cli:
             resp = await cli.post(
                 f"/myah/v1/confirm/{stream_id}",
-                json={"confirmation_id": "anything", "choice": "maybe"},
+                json={"confirmation_id": "anything", "choice": "maybe"}, headers=_AUTHED_HEADERS,
             )
             body = await resp.json()
 
@@ -177,7 +182,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     "/myah/v1/confirm/nonexistent",
-                    json={"choice": "approve"},
+                    json={"choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
 
         assert resp.status == 404
@@ -217,7 +222,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     "/myah/v1/confirm/stream-with-no-session",
-                    json={"confirmation_id": "exec-approval-123", "choice": "approve"},
+                    json={"confirmation_id": "exec-approval-123", "choice": "approve"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
@@ -242,7 +247,7 @@ class TestConfirmEndpointActionDispatch:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     "/myah/v1/confirm/any-stream",
-                    json={"confirmation_id": "stale-id", "choice": "deny"},
+                    json={"confirmation_id": "stale-id", "choice": "deny"}, headers=_AUTHED_HEADERS,
                 )
                 body = await resp.json()
 
