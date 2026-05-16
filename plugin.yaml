@@ -26,3 +26,32 @@ author: T3 Venture Labs Limited
 homepage: https://myah.dev
 repository: https://github.com/T3-Venture-Labs-Limited/myah-hermes-plugin
 license: MIT
+
+# Environment variables this plugin needs in ~/.hermes/.env before its
+# routes will accept requests. ``hermes plugins install`` reads this block
+# (see ``hermes_cli/plugins_cmd.py:_prompt_plugin_env_vars``) and prompts
+# the user for each name that isn't already set. Empty input is treated
+# as "skip — I'll set this later".
+#
+# MYAH_ADAPTER_AUTH_KEY is the shared bearer between the Myah platform
+# container and this plugin's standalone HTTP runner. The canonical flow
+# for OSS users is:
+#
+#   1. ``hermes plugins install T3-Venture-Labs-Limited/myah-hermes-plugin``
+#      → user can skip this prompt with an empty value; the routes will
+#      load but every authed endpoint returns 503 until the key is set.
+#   2. ``git clone … myah && cd myah && ./scripts/setup-myah-oss.sh``
+#      → setup script generates the key, writes it to BOTH the platform
+#      ``.env`` and ``~/.hermes/.env`` so both sides agree.
+#   3. ``hermes gateway restart`` → adapter picks up the key, requests
+#      start succeeding.
+#
+# Setting this value manually here only makes sense for hosted-mode
+# deployments where the platform side already has a fixed bearer token.
+requires_env:
+  - name: MYAH_ADAPTER_AUTH_KEY
+    description: |
+      Shared bearer token between the Myah platform container and this
+      plugin. Press Enter to skip — `scripts/setup-myah-oss.sh` in the
+      Myah platform clone will generate one and write it here.
+    secret: true
