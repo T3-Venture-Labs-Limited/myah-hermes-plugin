@@ -137,3 +137,34 @@ def test_wrapper_self_uninstalls_on_reload_when_env_var_unset(monkeypatch):
         "Wrapper should self-uninstall on reload when env var is unset; "
         "instead, the previously installed wrapper persists."
     )
+
+
+def test_token_comparison_uses_hmac_compare_digest(session_token, monkeypatch):
+    """[Characterization Cycle 5] The token-equality check MUST use
+    `hmac.compare_digest` for timing-safe comparison (not `==`).
+
+    This is NOT a strict TDD cycle: the patch from Cycles 1-2 already uses
+    `_hmac.compare_digest`, so this test passes immediately. It is a
+    REGRESSION CATCHER for accidental future replacement with `==` (which
+    would re-introduce a timing-attack vulnerability).
+
+    Per the TDD skill: characterization tests are allowed for
+    security-critical implementation-detail invariants. The compromise is
+    disclosed here so future readers understand.
+    """
+    from unittest.mock import MagicMock
+    import hmac
+
+    from myah_hermes_plugin.myah_admin.dashboard import plugin_api
+    importlib.reload(plugin_api)
+
+    spy = MagicMock(wraps=hmac.compare_digest)
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+
+    request = make_stub_request({"Authorization": f"Bearer {session_token}"})
+    _web_server._has_valid_session_token(request)
+
+    assert spy.call_count >= 1, (
+        "Token comparison must invoke hmac.compare_digest (timing-safe). "
+        "If this fails after a refactor, check that `==` was not introduced."
+    )
