@@ -84,6 +84,71 @@ spec). The CI guards make the swap auditable — when a public surface
 lands, delete the corresponding private access path and its guard test
 in the same PR.
 
+## [1.1.1] — 2026-05-20
+
+### Fixed
+
+- **`fix(dashboard)`: restore platform-to-agent auth after upstream Hermes
+  commit `ec9329e`** (`"fix(security): require dashboard auth for plugin
+  API routes"`). The upstream change removed the `/api/plugins/*`
+  exemption from `hermes_cli.web_server.auth_middleware`, so after a
+  HERMES_SHA bump past `ec9329e`, every `/api/plugins/myah-admin/*`
+  request from the platform backend started returning 401 (the platform
+  sends `Authorization: Bearer <HERMES_WEB_SESSION_TOKEN>`, but the
+  upstream middleware only accepts the dashboard's ephemeral
+  `_SESSION_TOKEN`). This shipped to production via `myah-hosted#192`
+  and required an emergency revert (`myah-hosted#198`) on 2026-05-19.
+
+  Fix: `myah_hermes_plugin/myah_admin/dashboard/plugin_api.py` now
+  monkey-patches `hermes_cli.web_server._has_valid_session_token` at
+  plugin-import time to also accept `HERMES_WEB_SESSION_TOKEN` via either
+  `Authorization: Bearer <token>` or `X-Hermes-Session-Token: <token>`.
+  Falls back to the upstream check for any other token value so the
+  dashboard's SPA UI (which sends `Bearer <ephemeral _SESSION_TOKEN>`)
+  keeps working unchanged. Uses `hmac.compare_digest` for timing-safe
+  equality. Wrapper is reload-safe via a `__wrapped_by_myah__` marker
+  that lets a later re-import with the env var unset restore the
+  original. See the patch header comment in `plugin_api.py` for full
+  rationale.
+
+- **Stale comment fix**: `myah_admin/dashboard/_common.py` no longer
+  claims plugin routes are middleware-exempt at the dashboard layer —
+  that contract held pre-`ec9329e` and is restored only by the patch
+  above, not by upstream middleware.
+
+### Tests
+
+- Strict TDD restoration: 4 RED-GREEN cycles in
+  `tests/myah_admin/dashboard/test_auth_compat.py` covering Bearer
+  acceptance, X-Hermes-Session-Token acceptance, fallback to upstream
+  for SPA tokens, and wrapper self-uninstall on env-var-unset reload.
+- 1 acknowledged-characterization test pinning `hmac.compare_digest`
+  usage as a regression catcher against accidental future `==`
+  replacement.
+- 1 integration smoke test (`tests/integration/`, marked
+  `@pytest.mark.integration`) that spawns a real `hermes dashboard`
+  subprocess with isolated `HERMES_HOME` and verifies the patched
+  plugin route is reachable end-to-end.
+- Git log shows the RED-GREEN interleave honoured per the TDD cycle.
+
+### Known limitation
+
+- On the plugin's currently-pinned hermes-agent commit
+  (`faa13e49f`, 2026-05-07), `auth_middleware` STILL exempts
+  `/api/plugins/*` — the regression we're patching against (`ec9329e`,
+  2026-05-10) is 3 days later than the pin. The patch is therefore a
+  no-op for end-to-end traffic on the current pin, and becomes
+  observable only after the hermes-agent dependency is bumped past
+  `ec9329e` (planned in `myah-hosted` follow-up). The unit tests
+  exercise the wrapper directly so the patch is verified regardless of
+  the dependency pin.
+
+### Other
+
+- `myah_hermes_plugin/__init__.py` `__version__` was stale at `0.3.0`
+  (the pyproject.toml was at `1.1.0`); both now move together to
+  `1.1.1`.
+
 ## [1.1.0] — 2026-05-10
 
 ### Added

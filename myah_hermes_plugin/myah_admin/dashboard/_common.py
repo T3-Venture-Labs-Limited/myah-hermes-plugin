@@ -5,10 +5,14 @@ the ``hermes`` gateway process (port 8642). This module supplies:
 
 1. ``require_session_token`` — FastAPI dependency that validates the
    ``X-Hermes-Session-Token`` (or legacy ``Authorization: Bearer``) header.
-   Plugin routes are auth-exempt at the dashboard middleware (see
-   ``hermes_cli/web_server.py:231``), so each plugin route MUST authenticate
-   itself. We reuse the dashboard's ``HERMES_WEB_SESSION_TOKEN`` env var that
-   the platform already injects on container spawn.
+   Post-upstream-commit ``ec9329e`` ("fix(security): require dashboard auth
+   for plugin API routes"), Hermes's ``auth_middleware`` no longer exempts
+   ``/api/plugins/*`` — see ``hermes_cli/web_server.py::auth_middleware``.
+   Our ``plugin_api.py`` patches ``_has_valid_session_token`` to also accept
+   ``HERMES_WEB_SESSION_TOKEN`` so the platform's Bearer-injected calls pass
+   the new middleware gate. ``require_session_token`` (below) remains the
+   defence-in-depth per-route check that reads the same env var the platform
+   already injects on container spawn.
 
 2. ``GatewayClient`` — small HTTP client to reach the runtime-control admin
    surface at ``http://localhost:{API_SERVER_PORT}/myah/v1/admin/*`` for

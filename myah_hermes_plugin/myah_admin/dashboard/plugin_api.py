@@ -45,6 +45,65 @@ Because this file is loaded as a real package member (never via
 
 from __future__ import annotations
 
+# ── Hermes auth-compat patch (NousResearch/hermes-agent ec9329e regression) ─
+# WHY: Upstream commit ec9329e ("fix(security): require dashboard auth for
+#   plugin API routes") removed the /api/plugins/* exemption from
+#   hermes_cli.web_server.auth_middleware. Post-ec9329e, all /api/* requests
+#   (minus _PUBLIC_API_PATHS) are validated against _SESSION_TOKEN — an
+#   ephemeral random token regenerated at each `hermes dashboard` start,
+#   known only to the SPA HTML the dashboard serves to the browser.
+#   Platform-to-agent calls inject HERMES_WEB_SESSION_TOKEN as Bearer; that
+#   no longer matches and every /api/plugins/myah-admin/* request returns 401.
+#
+# WHAT: Wrap web_server._has_valid_session_token so it ALSO accepts the
+#   env-var token via either header convention:
+#     - Authorization: Bearer <HERMES_WEB_SESSION_TOKEN>
+#     - X-Hermes-Session-Token: <HERMES_WEB_SESSION_TOKEN>
+#   For all other token values, defer to the original upstream check so the
+#   dashboard SPA UI (which sends Bearer <ephemeral _SESSION_TOKEN>) keeps
+#   working. Timing-safe equality via hmac.compare_digest.
+#
+# IDEMPOTENCY: The wrapper is marked with __wrapped_by_myah__ holding the
+#   captured original. On a later re-import with the env var unset, the
+#   original is restored — module-level import logic is reload-safe.
+#
+# FOLLOWUP: Upstream PR (forthcoming) will teach hermes_cli.web_server to
+#   natively read HERMES_WEB_SESSION_TOKEN, retiring this patch.
+import hmac as _hmac
+import os as _os
+
+try:
+    from hermes_cli import web_server as _hcl_ws  # type: ignore
+except ImportError:
+    _hcl_ws = None  # plugin imported outside dashboard (tests, partial install)
+
+_myah_env_token = _os.environ.get("HERMES_WEB_SESSION_TOKEN") or ""
+if _hcl_ws is not None and _myah_env_token:
+    # CRITICAL: capture original BEFORE rebinding to avoid infinite recursion.
+    _upstream_check = _hcl_ws._has_valid_session_token
+    _expect_bearer = f"Bearer {_myah_env_token}".encode()
+    _expect_xtoken = _myah_env_token.encode()
+
+    def _myah_has_valid_session_token(request) -> bool:
+        auth = request.headers.get("authorization", "").encode()
+        if auth and _hmac.compare_digest(auth, _expect_bearer):
+            return True
+        xt = request.headers.get("x-hermes-session-token", "").encode()
+        if xt and _hmac.compare_digest(xt, _expect_xtoken):
+            return True
+        return _upstream_check(request)
+
+    # Self-uninstall marker: stores the captured original so a later
+    # re-import with the env var unset can restore it (see IDEMPOTENCY above).
+    _myah_has_valid_session_token.__wrapped_by_myah__ = _upstream_check
+    _hcl_ws._has_valid_session_token = _myah_has_valid_session_token
+elif _hcl_ws is not None:
+    # Env var unset on (re-)import — restore the original if we previously wrapped.
+    _prev = getattr(_hcl_ws._has_valid_session_token, "__wrapped_by_myah__", None)
+    if _prev is not None:
+        _hcl_ws._has_valid_session_token = _prev
+# ───────────────────────────────────────────────────────────────────────────
+
 from fastapi import APIRouter
 
 from . import (
