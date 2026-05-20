@@ -51,9 +51,11 @@ import asyncio
 import logging
 import os
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import aiohttp
 
@@ -72,19 +74,182 @@ _BOOTSTRAP_AGE_SECS = 60
 
 _TICK_INTERVAL_SECS = 2.0
 _HTTP_TIMEOUT_SECS = 15
+_PROBE_TIMEOUT_SECS = 5
+_BACKOFF_SECS = 30
 
 _running_task: Optional[asyncio.Task] = None
 
+# Consecutive POST-failure counter (Task 1.6 / spec §6.2). Resets on
+# any successful POST. At threshold 3 we escalate to
+# ``sentry_sdk.capture_message`` for critical alerting.
+_consecutive_post_failures = 0
+
+
+def _get_bearer() -> str:
+    """Read the platform bearer token, canonical-first.
+
+    Per spec-review HIGH-5: in hosted containers, ``containers.py``
+    injects ``MYAH_PLATFORM_BEARER`` (NOT ``MYAH_AGENT_BEARER_TOKEN``).
+    On OSS hosts, ``setup-myah-oss.sh`` writes ``MYAH_AGENT_BEARER_TOKEN``.
+    Read both, prefer canonical for forward-compatibility — the legacy
+    name is the lower-priority fallback.
+
+    The pre-fix watcher read only ``MYAH_AGENT_BEARER_TOKEN`` and so
+    silently no-op'd in hosted prod because the canonical name was the
+    only one set there.
+    """
+    return (
+        os.environ.get("MYAH_PLATFORM_BEARER", "")
+        or os.environ.get("MYAH_AGENT_BEARER_TOKEN", "")
+    )
+
+
+def _probe_platform() -> bool:
+    """GET ``MYAH_PLATFORM_BASE_URL/health`` with a 5s timeout.
+
+    Returns True iff 200 ≤ status < 300.
+
+    Per spec-review CRIT-3: ``/health`` is a **root-level** FastAPI
+    route, NOT ``/api/v1/health``. ``@app.get`` is GET-only — issuing
+    HEAD would return 405 and falsely report the platform unreachable.
+    """
+    base = os.environ.get("MYAH_PLATFORM_BASE_URL", "").rstrip("/")
+    if not base:
+        return False
+    url = urljoin(base + "/", "health")
+    try:
+        with urllib.request.urlopen(url, timeout=_PROBE_TIMEOUT_SECS) as resp:
+            status = getattr(resp, "status", None) or getattr(resp, "code", 0)
+            return 200 <= status < 300
+    except Exception:
+        return False
+
+
+def _sentry_breadcrumb_safe(**kwargs) -> None:
+    """Add a Sentry breadcrumb without raising if ``sentry_sdk`` is
+    unavailable or its API changes. The watcher must never crash on
+    observability concerns."""
+    try:
+        import sentry_sdk
+        sentry_sdk.add_breadcrumb(**kwargs)
+    except Exception:
+        pass
+
+
+def _verify_platform_reachable_or_log() -> bool:
+    """Verify the platform is reachable; log a loud ERROR otherwise.
+
+    Returns True iff base URL is set AND the probe returns 2xx.
+    Failure path logs ERROR + drops a Sentry breadcrumb. Caller is
+    expected to back off and retry rather than silently no-op.
+    """
+    base = os.environ.get("MYAH_PLATFORM_BASE_URL", "").rstrip("/")
+    if not base:
+        logger.error(
+            "cron watcher: MYAH_PLATFORM_BASE_URL not set; cron output will "
+            "not reach the chat. Check ~/.hermes/.env or container env injection."
+        )
+        _sentry_breadcrumb_safe(
+            category="myah.cron_watcher",
+            level="error",
+            message="MYAH_PLATFORM_BASE_URL unset",
+        )
+        return False
+    if not _probe_platform():
+        logger.error(
+            f"cron watcher: MYAH_PLATFORM_BASE_URL={base} unreachable "
+            f"(probe GET /health timed out or returned non-2xx). Cron output "
+            f"will not reach the chat until this is resolved."
+        )
+        _sentry_breadcrumb_safe(
+            category="myah.cron_watcher",
+            level="error",
+            message=f"platform unreachable at {base}",
+        )
+        return False
+    return True
+
+
+def _on_post_success() -> None:
+    """Reset the consecutive-failure counter after a successful POST."""
+    global _consecutive_post_failures
+    _consecutive_post_failures = 0
+
+
+def _on_post_failure(job_id: str, error: str) -> None:
+    """Record a POST failure. Logs at ERROR + drops a Sentry breadcrumb.
+    Escalates to ``sentry_sdk.capture_message`` once 3 consecutive
+    failures accumulate so on-call gets a real alert (a breadcrumb-only
+    surface gets lost in the issue feed)."""
+    global _consecutive_post_failures
+    _consecutive_post_failures += 1
+    logger.error(
+        f"cron watcher: webhook POST failed for job={job_id}: {error} "
+        f"(consecutive failures: {_consecutive_post_failures})"
+    )
+    _sentry_breadcrumb_safe(
+        category="myah.cron_watcher",
+        level="error",
+        message=f"webhook POST failed for {job_id}",
+        data={
+            "error": error,
+            "consecutive_failures": _consecutive_post_failures,
+        },
+    )
+    if _consecutive_post_failures >= 3:
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"cron watcher: 3+ consecutive POST failures (last: {error})",
+                level="error",
+            )
+        except Exception:
+            pass
+
 
 async def _watch_loop() -> None:
+    """Main watcher loop.
+
+    Before the spec §6.2 fix this method silently ``return``ed when the
+    env vars were missing — meaning hosted prod (which sets
+    ``MYAH_PLATFORM_BEARER``, not the legacy ``MYAH_AGENT_BEARER_TOKEN``
+    name the old code read) ran with a permanently-idle watcher and
+    every cron output was silently dropped.
+
+    New behavior:
+    * Read bearer canonical-first via :func:`_get_bearer`.
+    * If env vars are missing → ERROR + breadcrumb, back off 30 s, retry.
+    * If env vars present but the platform doesn't answer
+      ``GET /health`` → ERROR + breadcrumb, back off 30 s, retry.
+    * Once reachable, fall into the normal tick loop.
+    """
     base_url = os.environ.get("MYAH_PLATFORM_BASE_URL", "").rstrip("/")
-    bearer = os.environ.get("MYAH_AGENT_BEARER_TOKEN", "")
-    if not (base_url and bearer):
-        logger.info(
-            "cron watcher: MYAH_PLATFORM_BASE_URL or MYAH_AGENT_BEARER_TOKEN unset; "
-            "watcher will be a no-op"
+    bearer = _get_bearer()
+    while not (base_url and bearer):
+        logger.error(
+            "cron watcher: MYAH_PLATFORM_BASE_URL or platform bearer unset; "
+            "cron output will NOT reach the chat. Check container env injection "
+            "(MYAH_PLATFORM_BEARER) or OSS host env "
+            "(~/.hermes/.env: MYAH_AGENT_BEARER_TOKEN). "
+            f"Watcher will retry every {_BACKOFF_SECS}s until both are set."
         )
-        return
+        _sentry_breadcrumb_safe(
+            category="myah.cron_watcher",
+            level="error",
+            message="env vars unset; watcher idle",
+            data={
+                "base_url_set": bool(base_url),
+                "bearer_set": bool(bearer),
+            },
+        )
+        await asyncio.sleep(_BACKOFF_SECS)
+        base_url = os.environ.get("MYAH_PLATFORM_BASE_URL", "").rstrip("/")
+        bearer = _get_bearer()
+    logger.info("cron watcher: env configured; starting reachability probe.")
+
+    while not _verify_platform_reachable_or_log():
+        await asyncio.sleep(_BACKOFF_SECS)
+    logger.info("cron watcher: platform reachable; entering tick loop.")
 
     while True:
         try:
@@ -175,13 +340,11 @@ async def _deliver(
                         "cron watcher: delivered job=%s chat=%s status=%s",
                         job_id, payload["chat_id"], resp.status,
                     )
+                    _on_post_success()
                 else:
-                    logger.warning(
-                        "cron watcher: webhook returned status=%s for job=%s",
-                        resp.status, job_id,
-                    )
-    except Exception:
-        logger.warning("cron watcher: webhook POST failed for job=%s", job_id)
+                    _on_post_failure(job_id, f"HTTP {resp.status}")
+    except Exception as exc:
+        _on_post_failure(job_id, str(exc) or type(exc).__name__)
 
 
 _started = False
