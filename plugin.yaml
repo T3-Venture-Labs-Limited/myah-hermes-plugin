@@ -7,7 +7,7 @@
 
 manifest_version: 1
 name: myah
-version: 1.1.0
+version: 1.1.1
 
 description: |
   Myah platform adapter for Hermes Agent. Installs the Myah platform
