@@ -45,12 +45,13 @@ Because this file is loaded as a real package member (never via
 
 from __future__ import annotations
 
-# ── Hermes auth-compat patch (P1 — Cycles 1-3) ─────────────────────────────
+# ── Hermes auth-compat patch (P1 — Cycles 1-4) ─────────────────────────────
 # Cycle 1: accept HERMES_WEB_SESSION_TOKEN as Authorization: Bearer.
 # Cycle 2: ALSO accept HERMES_WEB_SESSION_TOKEN as X-Hermes-Session-Token.
 # Cycle 3: fall back to upstream _has_valid_session_token so the dashboard's
 #          SPA UI (which sends Bearer <ephemeral _SESSION_TOKEN>) keeps working.
-# Subsequent cycles: self-uninstall on env-var-unset reload (Cycle 4).
+# Cycle 4: on reload with env var unset, self-uninstall the wrapper so the
+#          original upstream function is restored (idempotent).
 import hmac as _hmac
 import os as _os
 
@@ -75,7 +76,15 @@ if _hcl_ws is not None and _myah_env_token:
             return True
         return _upstream_check(request)
 
+    # Marker for Cycle 4 self-uninstall: stores the captured original so a
+    # later reload with env var unset can restore it.
+    _myah_has_valid_session_token.__wrapped_by_myah__ = _upstream_check
     _hcl_ws._has_valid_session_token = _myah_has_valid_session_token
+elif _hcl_ws is not None:
+    # Env var unset on (re-)import — restore the original if we previously wrapped.
+    _prev = getattr(_hcl_ws._has_valid_session_token, "__wrapped_by_myah__", None)
+    if _prev is not None:
+        _hcl_ws._has_valid_session_token = _prev
 # ───────────────────────────────────────────────────────────────────────────
 
 from fastapi import APIRouter
