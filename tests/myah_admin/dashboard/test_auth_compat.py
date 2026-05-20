@@ -53,3 +53,17 @@ def make_stub_request(headers: dict):
     """
     raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
     return type("StubRequest", (), {"headers": Headers(raw=raw)})()
+
+
+def test_bearer_with_env_var_token_returns_true_after_reload(session_token):
+    """[RED Cycle 1] After plugin_api reload with HERMES_WEB_SESSION_TOKEN set,
+    a request carrying `Authorization: Bearer <env-var-token>` is accepted.
+
+    This drives Cycle 1's GREEN step (P1.2) to install a wrapper on
+    `web_server._has_valid_session_token` that recognises our env-var Bearer.
+    """
+    from myah_hermes_plugin.myah_admin.dashboard import plugin_api
+    importlib.reload(plugin_api)
+
+    request = make_stub_request({"Authorization": f"Bearer {session_token}"})
+    assert _web_server._has_valid_session_token(request) is True
