@@ -67,3 +67,20 @@ def test_bearer_with_env_var_token_returns_true_after_reload(session_token):
 
     request = make_stub_request({"Authorization": f"Bearer {session_token}"})
     assert _web_server._has_valid_session_token(request) is True
+
+
+def test_x_hermes_session_token_with_env_var_returns_true_after_reload(session_token):
+    """[RED Cycle 2] After plugin_api reload with HERMES_WEB_SESSION_TOKEN set,
+    a request carrying `X-Hermes-Session-Token: <env-var-token>` (no Authorization)
+    is accepted.
+
+    Drives Cycle 2's GREEN step (P1.4) to add an `X-Hermes-Session-Token` branch
+    alongside Cycle 1's Bearer branch. `X-Hermes-Session-Token` is Hermes's
+    preferred header name (per `web_server.py:_SESSION_HEADER_NAME`); the plugin's
+    own `require_session_token` dependency already accepts both header forms.
+    """
+    from myah_hermes_plugin.myah_admin.dashboard import plugin_api
+    importlib.reload(plugin_api)
+
+    request = make_stub_request({"X-Hermes-Session-Token": session_token})
+    assert _web_server._has_valid_session_token(request) is True
