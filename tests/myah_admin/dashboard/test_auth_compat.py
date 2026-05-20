@@ -106,3 +106,34 @@ def test_spa_session_token_accepted_via_upstream_fallback(session_token):
     )
     request = make_stub_request({"Authorization": f"Bearer {spa_token}"})
     assert _web_server._has_valid_session_token(request) is True
+
+
+def test_wrapper_self_uninstalls_on_reload_when_env_var_unset(monkeypatch):
+    """[RED Cycle 4] On a reload with HERMES_WEB_SESSION_TOKEN UNSET, a
+    previously-installed wrapper must be uninstalled so upstream's original
+    `_has_valid_session_token` is restored.
+
+    Drives Cycle 4's GREEN step (P1.8) to mark the wrapper with
+    `__wrapped_by_myah__` and add an `elif _hcl_ws is not None:` branch that
+    restores the original if the marker is found.
+
+    Today, with only Cycles 1-3 in place, the module-level `if` block has no
+    else branch — reloading with env unset is a no-op, the wrapper persists,
+    and the assertion fails.
+    """
+    from myah_hermes_plugin.myah_admin.dashboard import plugin_api
+
+    # 1. Set env var + reload → wrapper installs.
+    monkeypatch.setenv("HERMES_WEB_SESSION_TOKEN", "test-token-32chars-XXXXXXXXXXXXXX")
+    importlib.reload(plugin_api)
+    assert _web_server._has_valid_session_token is not _ORIGINAL_HAS_VALID, (
+        "Invariant: wrapper must be installed after reload with env var set."
+    )
+
+    # 2. Unset env var + reload → wrapper must be uninstalled.
+    monkeypatch.delenv("HERMES_WEB_SESSION_TOKEN")
+    importlib.reload(plugin_api)
+    assert _web_server._has_valid_session_token is _ORIGINAL_HAS_VALID, (
+        "Wrapper should self-uninstall on reload when env var is unset; "
+        "instead, the previously installed wrapper persists."
+    )
