@@ -94,6 +94,35 @@ def _load_cron_jobs_safely() -> list:
         return []
 
 
+def _cron_last_run_sort_key(job: dict) -> tuple:
+    """Sort key for cron jobs by ``last_run_at``, defensive against mixed types.
+
+    Upstream ``cron/jobs.py:872`` writes ``last_run_at`` as an ISO 8601
+    string (``_hermes_now().isoformat()``), and newly-created jobs at
+    ``cron/jobs.py:655`` start with ``last_run_at: None``. The pre-fix
+    sort key ``job.get("last_run_at") or float("-inf")`` raised
+    ``TypeError: '<' not supported between instances of 'str' and 'float'``
+    when both shapes appeared in the same sort. Caught by reviewer of
+    PR #3 (2026-05-19).
+
+    The returned tuple ensures:
+
+    1. Jobs with ``last_run_at`` set always rank above ``None``-valued
+       jobs (the boolean primary key), regardless of how ``str()``
+       coerces non-ISO inputs. This is the critical correctness property
+       for the ``reverse=True`` sort caller.
+    2. Among jobs that have a value, ISO 8601 strings sort
+       lexicographically in chronological order (the format is designed
+       for this) — newer wins under ``reverse=True``.
+    3. If anyone ever passes a numeric ``last_run_at`` (none today, but
+       the tests historically used ``1700000000.0``), ``str()`` coerces
+       it to a digit string that still compares sensibly within a
+       single same-shape sort.
+    """
+    value = job.get("last_run_at")
+    return (value is not None, str(value) if value is not None else "")
+
+
 def _recover_cron_job_id_from_session_key() -> str:
     """Read the current session key and parse a cron job_id from it.
 
@@ -2125,12 +2154,23 @@ class MyahAdapter(BasePlatformAdapter):
                 ]
                 if matches:
                     # Pick the most recent last_run_at; treat missing
-                    # values as -inf so freshly-created jobs that have
-                    # never run yet don't shadow real recent runs.
-                    matches.sort(
-                        key=lambda j: j.get("last_run_at") or float("-inf"),
-                        reverse=True,
-                    )
+                    # values as empty-string so freshly-created jobs
+                    # (cron/jobs.py:655 — last_run_at=None) sort below
+                    # any job that's actually run.
+                    #
+                    # Upstream writes last_run_at as ISO 8601 string
+                    # (cron/jobs.py:872 — _hermes_now().isoformat()).
+                    # ISO 8601 is specifically designed so lexicographic
+                    # string compare matches chronological order, so
+                    # str-string compare gives the correct most-recent.
+                    #
+                    # The (has_value, str) tuple form ensures None-valued
+                    # jobs always lose to ANY job with a value, regardless
+                    # of how str() coerces non-ISO inputs. This guards
+                    # against the pre-fix TypeError when last_run_at was
+                    # a mix of ISO strings and None (caught by PR #3
+                    # reviewer, 2026-05-19).
+                    matches.sort(key=_cron_last_run_sort_key, reverse=True)
                     chosen = matches[0]
                     meta["job_id"] = chosen.get("id")
                     meta.setdefault("job_name", chosen.get("name") or chosen.get("id"))

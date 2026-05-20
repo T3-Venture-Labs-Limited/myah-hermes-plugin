@@ -283,3 +283,101 @@ class TestCronJobIdRecovery:
         assert recorder.posts == [], (
             "non-cron session_key must not be parsed as cron recovery"
         )
+
+    @pytest.mark.asyncio
+    async def test_send_tiebreaker_handles_iso_string_and_none(self, monkeypatch):
+        """Regression: real upstream cron writes ``last_run_at`` as an ISO
+        string (``cron/jobs.py:872`` — ``_hermes_now().isoformat()``), but
+        newly-created jobs start with ``last_run_at: None``
+        (``cron/jobs.py:655``).
+
+        The pre-fix sort key ``j.get("last_run_at") or float("-inf")``
+        mixed ``str`` and ``float`` types and raised ``TypeError`` in
+        Python 3 when both shapes were in the same matches list.
+
+        Caught by reviewer of PR #3 (2026-05-19); fixed by normalising
+        the sort key to a single comparable shape.
+        """
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", _PLATFORM_BASE_URL)
+        monkeypatch.setenv("MYAH_PLATFORM_BEARER", _PLATFORM_BEARER)
+        monkeypatch.setenv("MYAH_USER_ID", _USER_ID)
+
+        never_run = {
+            "id": "neverrun1234",
+            "name": "newly-created",
+            "origin": {"platform": "myah", "chat_id": _CHAT_ID},
+            "last_run_at": None,
+        }
+        recently_run = {
+            "id": "recentjob567",
+            "name": "ran-once",
+            "origin": {"platform": "myah", "chat_id": _CHAT_ID},
+            "last_run_at": "2026-05-19T12:00:00+00:00",
+        }
+
+        recorder = _RecordingClientSession()
+
+        with patch(
+            "myah_hermes_plugin.cron_approval._get_current_session_key",
+            return_value="",
+        ), patch(
+            "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
+            return_value=[never_run, recently_run],
+        ), patch("aiohttp.ClientSession", return_value=recorder):
+            # Must NOT raise TypeError.
+            await adapter.send(
+                _CHAT_ID,
+                "iso-vs-none content",
+                metadata={},
+            )
+
+        assert recorder.posts, "webhook was not invoked — recovery silently failed"
+        body = recorder.posts[0]["json"]
+        # The job with last_run_at set must win against last_run_at=None.
+        assert body["job_id"] == "recentjob567", (
+            f"expected job with ISO last_run_at to win; got {body['job_id']!r} "
+            f"— None-valued job should sort last in reverse=True order"
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_tiebreaker_two_iso_strings(self, monkeypatch):
+        """ISO 8601 strings sort lexicographically in chronological order
+        (the format is specifically designed for this). Verify the newer
+        ISO string wins."""
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", _PLATFORM_BASE_URL)
+        monkeypatch.setenv("MYAH_PLATFORM_BEARER", _PLATFORM_BEARER)
+        monkeypatch.setenv("MYAH_USER_ID", _USER_ID)
+
+        older = {
+            "id": "olderiso1234",
+            "name": "older-iso",
+            "origin": {"platform": "myah", "chat_id": _CHAT_ID},
+            "last_run_at": "2026-05-18T00:00:00+00:00",
+        }
+        newer = {
+            "id": "neweriso5678",
+            "name": "newer-iso",
+            "origin": {"platform": "myah", "chat_id": _CHAT_ID},
+            "last_run_at": "2026-05-19T12:00:00+00:00",
+        }
+
+        recorder = _RecordingClientSession()
+
+        with patch(
+            "myah_hermes_plugin.cron_approval._get_current_session_key",
+            return_value="",
+        ), patch(
+            "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
+            return_value=[older, newer],
+        ), patch("aiohttp.ClientSession", return_value=recorder):
+            await adapter.send(_CHAT_ID, "two-iso content", metadata={})
+
+        assert recorder.posts
+        body = recorder.posts[0]["json"]
+        assert body["job_id"] == "neweriso5678"
