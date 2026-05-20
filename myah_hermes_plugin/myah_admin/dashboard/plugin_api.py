@@ -45,10 +45,10 @@ Because this file is loaded as a real package member (never via
 
 from __future__ import annotations
 
-# ── Hermes auth-compat patch (P1 minimal — Cycle 1) ────────────────────────
-# Cycle 1 of 4: accept HERMES_WEB_SESSION_TOKEN as Authorization: Bearer header.
-# Subsequent cycles add X-Hermes-Session-Token (Cycle 2), upstream fallback
-# (Cycle 3), and self-uninstall on env-var-unset reload (Cycle 4).
+# ── Hermes auth-compat patch (P1 — Cycles 1-2) ─────────────────────────────
+# Cycle 1: accept HERMES_WEB_SESSION_TOKEN as Authorization: Bearer.
+# Cycle 2: ALSO accept HERMES_WEB_SESSION_TOKEN as X-Hermes-Session-Token.
+# Subsequent cycles: upstream fallback (Cycle 3), self-uninstall (Cycle 4).
 import hmac as _hmac
 import os as _os
 
@@ -60,10 +60,14 @@ except ImportError:
 _myah_env_token = _os.environ.get("HERMES_WEB_SESSION_TOKEN") or ""
 if _hcl_ws is not None and _myah_env_token:
     _expect_bearer = f"Bearer {_myah_env_token}".encode()
+    _expect_xtoken = _myah_env_token.encode()
 
     def _myah_has_valid_session_token(request) -> bool:
         auth = request.headers.get("authorization", "").encode()
         if auth and _hmac.compare_digest(auth, _expect_bearer):
+            return True
+        xt = request.headers.get("x-hermes-session-token", "").encode()
+        if xt and _hmac.compare_digest(xt, _expect_xtoken):
             return True
         return False
 
