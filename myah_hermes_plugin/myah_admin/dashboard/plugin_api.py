@@ -45,13 +45,30 @@ Because this file is loaded as a real package member (never via
 
 from __future__ import annotations
 
-# ── Hermes auth-compat patch (P1 — Cycles 1-4) ─────────────────────────────
-# Cycle 1: accept HERMES_WEB_SESSION_TOKEN as Authorization: Bearer.
-# Cycle 2: ALSO accept HERMES_WEB_SESSION_TOKEN as X-Hermes-Session-Token.
-# Cycle 3: fall back to upstream _has_valid_session_token so the dashboard's
-#          SPA UI (which sends Bearer <ephemeral _SESSION_TOKEN>) keeps working.
-# Cycle 4: on reload with env var unset, self-uninstall the wrapper so the
-#          original upstream function is restored (idempotent).
+# ── Hermes auth-compat patch (NousResearch/hermes-agent ec9329e regression) ─
+# WHY: Upstream commit ec9329e ("fix(security): require dashboard auth for
+#   plugin API routes") removed the /api/plugins/* exemption from
+#   hermes_cli.web_server.auth_middleware. Post-ec9329e, all /api/* requests
+#   (minus _PUBLIC_API_PATHS) are validated against _SESSION_TOKEN — an
+#   ephemeral random token regenerated at each `hermes dashboard` start,
+#   known only to the SPA HTML the dashboard serves to the browser.
+#   Platform-to-agent calls inject HERMES_WEB_SESSION_TOKEN as Bearer; that
+#   no longer matches and every /api/plugins/myah-admin/* request returns 401.
+#
+# WHAT: Wrap web_server._has_valid_session_token so it ALSO accepts the
+#   env-var token via either header convention:
+#     - Authorization: Bearer <HERMES_WEB_SESSION_TOKEN>
+#     - X-Hermes-Session-Token: <HERMES_WEB_SESSION_TOKEN>
+#   For all other token values, defer to the original upstream check so the
+#   dashboard SPA UI (which sends Bearer <ephemeral _SESSION_TOKEN>) keeps
+#   working. Timing-safe equality via hmac.compare_digest.
+#
+# IDEMPOTENCY: The wrapper is marked with __wrapped_by_myah__ holding the
+#   captured original. On a later re-import with the env var unset, the
+#   original is restored — module-level import logic is reload-safe.
+#
+# FOLLOWUP: Upstream PR (forthcoming) will teach hermes_cli.web_server to
+#   natively read HERMES_WEB_SESSION_TOKEN, retiring this patch.
 import hmac as _hmac
 import os as _os
 
@@ -76,8 +93,8 @@ if _hcl_ws is not None and _myah_env_token:
             return True
         return _upstream_check(request)
 
-    # Marker for Cycle 4 self-uninstall: stores the captured original so a
-    # later reload with env var unset can restore it.
+    # Self-uninstall marker: stores the captured original so a later
+    # re-import with the env var unset can restore it (see IDEMPOTENCY above).
     _myah_has_valid_session_token.__wrapped_by_myah__ = _upstream_check
     _hcl_ws._has_valid_session_token = _myah_has_valid_session_token
 elif _hcl_ws is not None:
