@@ -933,16 +933,43 @@ class MyahAdapter(BasePlatformAdapter):
             if pending_secret:
                 pending_secret['event'].set()
 
-            # Clean up dual mappings (Fix 1)
-            self._chat_id_streams.pop(chat_id, None)
-            self._session_streams.pop(session_key, None)
-            self._stream_sessions.pop(stream_id, None)
+            # ── Deferred cleanup when approvals pending (Phase 1 PR 1 §1.3) ──
+            # If an action confirmation (e.g. plugin cronjob approval)
+            # is still pending for this session, popping the dual
+            # mapping now would orphan the eventual /myah/v1/confirm
+            # callback — it looks up _stream_sessions[stream_id] to
+            # find the session_key and would get None → 404. Defer the
+            # cleanup until the approval resolves; the
+            # resolve_action_confirmation* path will _schedule_resolved_expiry
+            # which keeps the entry just long enough that the next user
+            # action drives a fresh dispatch + new mapping.
+            try:
+                from myah_hermes_plugin.cron_approval import _has_pending_approvals
+                _approvals_pending = _has_pending_approvals(session_key)
+            except Exception:  # noqa: BLE001 — never block cleanup on a queue read
+                logger.debug(
+                    "[myah] _has_pending_approvals lookup failed; defaulting to cleanup",
+                    exc_info=True,
+                )
+                _approvals_pending = False
 
-            # Phase F: clean up streaming workaround state
-            self._chat_id_session_keys.pop(chat_id, None)
-            self._native_streaming_used.discard(session_key)
-            self._stream_delta_invoked.discard(session_key)
-            self._stream_had_content.discard(stream_id)
+            if _approvals_pending:
+                logger.info(
+                    "[myah] deferring _stream_sessions cleanup for session=%s "
+                    "stream=%s (approval pending)",
+                    session_key, stream_id,
+                )
+            else:
+                # Clean up dual mappings (Fix 1)
+                self._chat_id_streams.pop(chat_id, None)
+                self._session_streams.pop(session_key, None)
+                self._stream_sessions.pop(stream_id, None)
+
+                # Phase F: clean up streaming workaround state
+                self._chat_id_session_keys.pop(chat_id, None)
+                self._native_streaming_used.discard(session_key)
+                self._stream_delta_invoked.discard(session_key)
+                self._stream_had_content.discard(stream_id)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
