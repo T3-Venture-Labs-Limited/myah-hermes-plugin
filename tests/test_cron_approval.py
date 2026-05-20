@@ -229,3 +229,125 @@ def test_plugin_cron_tool_exports_callable():
     entry = registry.get_entry("cronjob")
     assert entry is not None, "plugin's cron_tool did not register 'cronjob'"
     assert callable(entry.handler), "registered cronjob handler is not callable"
+
+
+# -----------------------------------------------------------------------------
+# Phase 1 PR 1 (spec §5.1) — extend approval timeout + cache resolved choice.
+# -----------------------------------------------------------------------------
+
+
+def test_request_action_confirmation_default_timeout_is_gateway_aligned(
+    fake_session, monkeypatch
+):
+    """The default timeout for an in-chat approval must come from
+    ``_get_gateway_timeout()`` (default 1800s) rather than the legacy
+    300s constant. Aligns with upstream tools/approval.py:1244.
+    """
+    monkeypatch.setattr(cron_approval, "_get_gateway_timeout", lambda: 1800)
+
+    captured: List[Dict[str, Any]] = []
+    _register_capturing_callback(fake_session, captured)
+
+    def _do_request():
+        cron_approval.request_action_confirmation(
+            action_type="cron_create",
+            description="x",
+            # NOTE: omitting `timeout` to exercise the default path.
+        )
+
+    t = threading.Thread(target=_do_request, daemon=True)
+    t.start()
+
+    for _ in range(200):
+        if captured:
+            break
+        threading.Event().wait(0.005)
+    assert captured, "notify callback was not invoked"
+
+    cid = captured[0]["payload"]["confirmation_id"]
+    entry = cron_approval._action_queues[cid]
+    assert entry["timeout"] == 1800, (
+        f"expected gateway-aligned default timeout=1800, got {entry.get('timeout')!r}"
+    )
+
+    # Cleanup
+    cron_approval.resolve_action_confirmation(cid, "approve")
+    t.join(timeout=2.0)
+
+
+def test_get_gateway_timeout_reads_approvals_block(tmp_path, monkeypatch):
+    """``_get_gateway_timeout`` reads ``approvals.gateway_timeout`` from
+    ``~/.hermes/config.yaml``; defaults to 1800 if missing or malformed.
+    """
+    import yaml
+
+    hermes_home = tmp_path / "hermes_home_cfg"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    cfg_path = hermes_home / "config.yaml"
+
+    # 1. With approvals.gateway_timeout=600 — returns 600.
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"gateway_timeout": 600}}))
+    assert cron_approval._get_gateway_timeout() == 600
+
+    # 2. With approvals block absent — returns 1800 default.
+    cfg_path.write_text(yaml.safe_dump({"other": {"foo": "bar"}}))
+    assert cron_approval._get_gateway_timeout() == 1800
+
+    # 3. With malformed YAML — defensive default 1800.
+    cfg_path.write_text("::: not yaml :::\n  - [unclosed\n")
+    assert cron_approval._get_gateway_timeout() == 1800
+
+    # 4. Missing config.yaml — returns 1800.
+    cfg_path.unlink()
+    assert cron_approval._get_gateway_timeout() == 1800
+
+
+def test_resolved_confirmation_cached_for_10s(fake_session, monkeypatch):
+    """After ``event.set()`` resolves a confirmation, the entry stays in
+    ``_action_queues`` for ~10s so an idempotent re-resolve returns the
+    cached choice instead of a 404."""
+    # Shrink the TTL to keep the test fast.
+    monkeypatch.setattr(cron_approval, "_RESOLVED_TTL_SECONDS", 0.2)
+
+    captured: List[Dict[str, Any]] = []
+    _register_capturing_callback(fake_session, captured)
+
+    def _do_request():
+        cron_approval.request_action_confirmation(
+            action_type="cron_create",
+            description="x",
+            options=["approve", "deny"],
+            timeout=5.0,
+        )
+
+    t = threading.Thread(target=_do_request, daemon=True)
+    t.start()
+
+    for _ in range(200):
+        if captured:
+            break
+        threading.Event().wait(0.005)
+    assert captured
+
+    cid = captured[0]["payload"]["confirmation_id"]
+    assert cron_approval.resolve_action_confirmation(cid, "approve") is True
+    t.join(timeout=2.0)
+
+    # Idempotent re-resolve returns the cached choice and reports True.
+    assert cid in cron_approval._action_queues, (
+        "resolved entry must remain in _action_queues until TTL expires"
+    )
+    entry = cron_approval._action_queues[cid]
+    assert entry["result"] == ["approve"]
+    assert cron_approval.resolve_action_confirmation(cid, "approve") is True
+
+    # After the TTL fires, the cached entry is gone and re-resolve 404s.
+    import time as _time
+
+    deadline = _time.time() + 2.0
+    while cid in cron_approval._action_queues and _time.time() < deadline:
+        _time.sleep(0.05)
+    assert cid not in cron_approval._action_queues
+    assert cron_approval.resolve_action_confirmation(cid, "approve") is False
