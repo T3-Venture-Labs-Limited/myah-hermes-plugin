@@ -73,6 +73,83 @@ from ._runner_state import (
 _MYAH_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Myah: per-attachment cap (defense-in-depth)
 _MYAH_PLATFORM_BASE_URL = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')  # Myah: platform URL
 _MYAH_PLATFORM_BEARER = _myah_os.environ.get('MYAH_PLATFORM_BEARER')      # Myah: shared bearer
+
+
+def _load_cron_jobs_safely() -> list:
+    """Load cron jobs from jobs.json without raising.
+
+    Indirection point for the cron Path A fallback recovery (Task 1.5 /
+    spec §6.1). Tests patch this symbol; production reads from upstream
+    ``cron.jobs.load_jobs``.
+
+    Returns an empty list if upstream isn't importable or the read
+    raises — the recovery path treats absence of jobs as "no signal"
+    rather than crashing the send() call.
+    """
+    try:
+        from cron.jobs import load_jobs  # type: ignore
+        jobs = load_jobs() or []
+        return [j for j in jobs if isinstance(j, dict)]
+    except Exception:
+        return []
+
+
+def _cron_last_run_sort_key(job: dict) -> tuple:
+    """Sort key for cron jobs by ``last_run_at``, defensive against mixed types.
+
+    Upstream ``cron/jobs.py:872`` writes ``last_run_at`` as an ISO 8601
+    string (``_hermes_now().isoformat()``), and newly-created jobs at
+    ``cron/jobs.py:655`` start with ``last_run_at: None``. The pre-fix
+    sort key ``job.get("last_run_at") or float("-inf")`` raised
+    ``TypeError: '<' not supported between instances of 'str' and 'float'``
+    when both shapes appeared in the same sort. Caught by reviewer of
+    PR #3 (2026-05-19).
+
+    The returned tuple ensures:
+
+    1. Jobs with ``last_run_at`` set always rank above ``None``-valued
+       jobs (the boolean primary key), regardless of how ``str()``
+       coerces non-ISO inputs. This is the critical correctness property
+       for the ``reverse=True`` sort caller.
+    2. Among jobs that have a value, ISO 8601 strings sort
+       lexicographically in chronological order (the format is designed
+       for this) — newer wins under ``reverse=True``.
+    3. If anyone ever passes a numeric ``last_run_at`` (none today, but
+       the tests historically used ``1700000000.0``), ``str()`` coerces
+       it to a digit string that still compares sensibly within a
+       single same-shape sort.
+    """
+    value = job.get("last_run_at")
+    return (value is not None, str(value) if value is not None else "")
+
+
+def _recover_cron_job_id_from_session_key() -> str:
+    """Read the current session key and parse a cron job_id from it.
+
+    The upstream scheduler builds session keys as
+    ``f"cron_{job_id}_{strftime}"`` at ``cron/scheduler.py:1319``.
+    The ``job_id`` portion is ``uuid.uuid4().hex[:12]`` (12 hex chars,
+    no underscores); the ``strftime`` portion contains underscores so we
+    cannot split on the last underscore. Take index 1 of a split.
+
+    Returns ``""`` when the key is empty, not cron-shaped, or malformed.
+    """
+    try:
+        from myah_hermes_plugin.cron_approval import _get_current_session_key
+        key = _get_current_session_key() or ''
+    except Exception:
+        return ''
+    if not key.startswith('cron_'):
+        return ''
+    parts = key.split('_', 2)  # ['cron', job_id, 'strftime…']
+    if len(parts) < 2:
+        return ''
+    candidate = parts[1]
+    # job_id is uuid.uuid4().hex[:12] → 12 hex chars. Defensive shape
+    # check so we don't mis-classify a malformed key.
+    if not candidate or not all(c in '0123456789abcdef' for c in candidate):
+        return ''
+    return candidate
 # ────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
@@ -2030,8 +2107,76 @@ class MyahAdapter(BasePlatformAdapter):
         on disk but never reached chat history.  See
         ``docs/superpowers/specs/2026-04-24-cron-origin-and-approval-design.md``.
         """
-        meta = metadata or {}
+        meta = dict(metadata) if metadata else {}
         is_cron_delivery = bool(meta.get("job_id"))
+
+        # ── Cron Path A: recover job_id when scheduler didn't forward it ──
+        # Vanilla upstream's cron/scheduler._deliver_result calls
+        # adapter.send(chat_id, content, metadata={"thread_id": ...})
+        # without forwarding the job dict — meta.job_id is absent and
+        # the cron delivery would silently fall down the SSE-first path
+        # (which doesn't persist to chat history).
+        #
+        # Recover via two signals, in order:
+        #   1. The session contextvar (set by the cron worker via
+        #      upstream tools.approval.set_current_session_key).
+        #   2. jobs.json lookup by origin.chat_id; pick the most recent
+        #      last_run_at when multiple jobs target the same chat.
+        # Either signal populates meta with job_id + job_name + origin
+        # and flips is_cron_delivery so the webhook path runs.
+        # See spec §6.1 Path A.
+        if not is_cron_delivery:
+            recovered_job_id = _recover_cron_job_id_from_session_key()
+            recovered_job: Optional[Dict[str, Any]] = None
+            if recovered_job_id:
+                for j in _load_cron_jobs_safely():
+                    if j.get("id") == recovered_job_id:
+                        recovered_job = j
+                        break
+                # Even without a jobs.json hit, the session key alone is
+                # enough to mark this as cron delivery — the webhook
+                # accepts the minimal payload.
+                meta["job_id"] = recovered_job_id
+                if recovered_job:
+                    meta.setdefault("job_name", recovered_job.get("name") or recovered_job_id)
+                    if recovered_job.get("origin"):
+                        meta.setdefault("origin", recovered_job["origin"])
+                else:
+                    meta.setdefault("job_name", recovered_job_id)
+                is_cron_delivery = True
+            elif chat_id:
+                # No session signal — try jobs.json lookup by chat_id.
+                matches = [
+                    j for j in _load_cron_jobs_safely()
+                    if isinstance(j.get("origin"), dict)
+                    and j["origin"].get("platform") == "myah"
+                    and j["origin"].get("chat_id") == chat_id
+                ]
+                if matches:
+                    # Pick the most recent last_run_at; treat missing
+                    # values as empty-string so freshly-created jobs
+                    # (cron/jobs.py:655 — last_run_at=None) sort below
+                    # any job that's actually run.
+                    #
+                    # Upstream writes last_run_at as ISO 8601 string
+                    # (cron/jobs.py:872 — _hermes_now().isoformat()).
+                    # ISO 8601 is specifically designed so lexicographic
+                    # string compare matches chronological order, so
+                    # str-string compare gives the correct most-recent.
+                    #
+                    # The (has_value, str) tuple form ensures None-valued
+                    # jobs always lose to ANY job with a value, regardless
+                    # of how str() coerces non-ISO inputs. This guards
+                    # against the pre-fix TypeError when last_run_at was
+                    # a mix of ISO strings and None (caught by PR #3
+                    # reviewer, 2026-05-19).
+                    matches.sort(key=_cron_last_run_sort_key, reverse=True)
+                    chosen = matches[0]
+                    meta["job_id"] = chosen.get("id")
+                    meta.setdefault("job_name", chosen.get("name") or chosen.get("id"))
+                    if chosen.get("origin"):
+                        meta.setdefault("origin", chosen["origin"])
+                    is_cron_delivery = True
 
         # ── Cron deliveries: always webhook (persistence path) ──
         if is_cron_delivery:
@@ -2055,7 +2200,11 @@ class MyahAdapter(BasePlatformAdapter):
                     logger.debug(
                         f"Live-preview SSE push for cron delivery failed (non-fatal): {exc}"
                     )
-            return await self._send_via_webhook(chat_id, content, metadata)
+            # Use the (possibly recovery-enriched) ``meta`` dict, NOT
+            # the caller's original ``metadata`` — otherwise Path A's
+            # recovered job_id/job_name/origin wouldn't reach the
+            # webhook payload builder.
+            return await self._send_via_webhook(chat_id, content, meta)
         # ────────────────────────────────────────────────────────
 
         # ── Phase F: native-streaming dedup ────────────────────────
