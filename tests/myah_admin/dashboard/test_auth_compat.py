@@ -84,3 +84,25 @@ def test_x_hermes_session_token_with_env_var_returns_true_after_reload(session_t
 
     request = make_stub_request({"X-Hermes-Session-Token": session_token})
     assert _web_server._has_valid_session_token(request) is True
+
+
+def test_spa_session_token_accepted_via_upstream_fallback(session_token):
+    """[RED Cycle 3] After reload with HERMES_WEB_SESSION_TOKEN set, a request
+    carrying `Authorization: Bearer <web_server._SESSION_TOKEN>` (the SPA's
+    ephemeral token, NOT our env-var token) is accepted via fallback to upstream.
+
+    Drives Cycle 3's GREEN step (P1.6) to capture `_upstream_check` before
+    rebinding and call it from the wrapper when neither env-var header matches.
+    Without fallback, the browser-facing dashboard SPA would 401 on its own
+    Bearer.
+    """
+    from myah_hermes_plugin.myah_admin.dashboard import plugin_api
+    importlib.reload(plugin_api)
+
+    spa_token = _web_server._SESSION_TOKEN
+    assert spa_token != session_token, (
+        "Test invariant: SPA _SESSION_TOKEN must differ from our env-var token; "
+        "otherwise this test doesn't distinguish env-var match from fallback."
+    )
+    request = make_stub_request({"Authorization": f"Bearer {spa_token}"})
+    assert _web_server._has_valid_session_token(request) is True
