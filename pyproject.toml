@@ -70,3 +70,6 @@ include = ["myah_hermes_plugin", "myah_hermes_plugin.*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that spawn real subprocesses (excluded by default in quick runs; run with `-m integration`)",
+]
