@@ -254,6 +254,24 @@ def register(ctx: Any) -> None:
         log.exception("Failed to register Sentry observability hooks")
     # ───────────────────────────────────────────────────────────────────
 
+    # ── Smart-Approvals audit logging (2026-05-21) ─────────────────────
+    # config.yaml ships approvals.mode: smart, which invokes an LLM
+    # "guardian" to auto-approve dangerous-pattern terminal commands.
+    # Upstream logs those auto-approvals at DEBUG (tools/approval.py
+    # line 1025), so they are invisible at production's INFO threshold.
+    # This filter promotes the matching DEBUG records to INFO in place
+    # so operators can grep agent.log for ``[smart-approval-audit]`` to
+    # see exactly what the LLM judge let through. Best-effort import —
+    # older plugin builds without observability.smart_approval_audit
+    # degrade to no-op rather than break the rest of register().
+    try:
+        from myah_hermes_plugin.observability import smart_approval_audit
+
+        smart_approval_audit.install()
+    except Exception:
+        log.exception("Failed to install Smart-Approvals audit filter")
+    # ───────────────────────────────────────────────────────────────────
+
     # ── MYAH_USER_ID bootstrap (Phase 8.2 OSS) ──────────────────────────
     # Hosted Myah injects MYAH_USER_ID per-container; OSS users would
     # otherwise need to paste it manually. Auto-discover via /whoami
