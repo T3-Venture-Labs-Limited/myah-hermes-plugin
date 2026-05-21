@@ -673,3 +673,144 @@ class TestStreamDeltaCallbackMarksContent:
             "The suppression-bug check expects _stream_had_content to mean "
             "'a real assistant message was delivered'."
         )
+
+
+# ── Bug D: action-confirmation callback registration ───────────────────────
+
+
+class TestActionNotifyRegistration:
+    """Regression tests (2026-05-21) for Bug D.
+
+    Production was silently auto-approving every cron-creation because
+    no production code path ever called ``register_gateway_notify``.
+    The plugin's ``_registered_callbacks`` dict was always empty at
+    ``request_action_confirmation`` lookup time, so the early-return at
+    ``cron_approval.py:162`` (``if callback is None: return "approve"``)
+    fired on every invocation. Verified empirically: 60 minutes of
+    production agent.log contained zero ``[HERMES] tool.confirmation_required``
+    log lines despite multiple cron-creation attempts.
+
+    Fix: the adapter must call ``register_gateway_notify(session_key, fn)``
+    when it sets up a session (mirroring the upstream pattern at
+    ``gateway/run.py:14190``), paired with the existing
+    ``unregister_gateway_notify`` cleanup at adapter.py:1741/2029.
+    """
+
+    def test_setup_action_notify_registers_callback_in_dispatcher(self):
+        """The new ``_setup_action_notify`` helper registers a callback
+        keyed by ``session_key`` in the dispatcher's
+        ``_registered_callbacks`` dict."""
+        from myah_hermes_plugin import dispatcher
+
+        adapter = _make_adapter()
+        session_key = "agent:main:myah:dm:bug-d-test-1"
+        stream_id = "stream-bug-d-1"
+        adapter._streams[stream_id] = asyncio.Queue()
+        adapter._session_streams[session_key] = stream_id
+
+        # Pre: ensure clean registry for this key
+        dispatcher._registered_callbacks.pop(session_key, None)
+
+        # Act
+        adapter._setup_action_notify(session_key, stream_id)
+
+        # Assert
+        assert session_key in dispatcher._registered_callbacks, (
+            "Adapter must populate dispatcher._registered_callbacks so "
+            "request_action_confirmation can dispatch instead of silently "
+            "auto-approving."
+        )
+        assert callable(dispatcher._registered_callbacks[session_key])
+
+        # Cleanup
+        dispatcher._registered_callbacks.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_registered_callback_pushes_confirmation_event_to_queue(self):
+        """When the dispatcher invokes the callback registered by
+        ``_setup_action_notify``, the adapter pushes a
+        ``tool.confirmation_required`` event onto the stream queue so the
+        platform's SSE pipeline forwards it to the frontend's
+        ConfirmationCard component."""
+        from myah_hermes_plugin import dispatcher
+
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        session_key = "agent:main:myah:dm:bug-d-test-2"
+        stream_id = "stream-bug-d-2"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._streams[stream_id] = q
+        adapter._session_streams[session_key] = stream_id
+
+        dispatcher._registered_callbacks.pop(session_key, None)
+        adapter._setup_action_notify(session_key, stream_id)
+
+        # Invoke as the dispatcher would (three-arity modern shape).
+        callback = dispatcher._registered_callbacks[session_key]
+        callback(
+            session_key,
+            {
+                "type": "tool.confirmation_required",
+                "confirmation_id": "test-conf-uuid",
+                "action_type": "cron_create",
+                "description": "Create recurring task: 'joke' every hour",
+                "options": ["approve", "approve_session", "deny"],
+                "metadata": {
+                    "schedule_display": "every hour",
+                    "prompt_preview": "Tell me a joke.",
+                },
+            },
+        )
+
+        # call_soon_threadsafe schedules onto the loop; yield once.
+        await asyncio.sleep(0)
+
+        event = q.get_nowait()
+        assert event["event"] == "tool.confirmation_required"
+        assert event["confirmation_id"] == "test-conf-uuid"
+        assert event["action_type"] == "cron_create"
+        assert event["description"] == "Create recurring task: 'joke' every hour"
+        assert event["options"] == ["approve", "approve_session", "deny"]
+        assert event["metadata"]["schedule_display"] == "every hour"
+
+        # Cleanup
+        dispatcher._registered_callbacks.pop(session_key, None)
+
+    def test_adapter_source_calls_register_gateway_notify(self):
+        """CI guard: the production adapter source MUST contain a call to
+        ``register_gateway_notify`` (NOT just the ``unregister_*`` half).
+        This catches the regression where the registration is accidentally
+        removed (the original bug — adapter had only ``unregister`` calls,
+        no ``register``).
+
+        Uses negative lookbehind so the assertion fails if only the
+        ``unregister_gateway_notify`` substring is present.
+        """
+        from myah_hermes_plugin.myah_platform import adapter as adapter_module
+        import inspect
+        import re
+
+        source = inspect.getsource(adapter_module)
+        # Match `register_gateway_notify` NOT preceded by "un" — i.e. the
+        # actual register call, not the unregister substring.
+        assert re.search(r"(?<!un)register_gateway_notify", source), (
+            "Adapter must call register_gateway_notify (not just unregister). "
+            "Without registration, request_action_confirmation auto-approves "
+            "silently and the cron-creation approval card never reaches the "
+            "user. See cron_approval.py:162 — the empty registry is the bug."
+        )
+
+    def test_setup_action_notify_invoked_after_session_stream_registration(self):
+        """Behavioral lifecycle check: the helper ``_setup_action_notify``
+        is reachable from the codepath that sets ``_session_streams``.
+        Cheap source-text check; pairs with the call-graph guard above."""
+        from myah_hermes_plugin.myah_platform import adapter as adapter_module
+        import inspect
+
+        source = inspect.getsource(adapter_module)
+        # Both must appear in the adapter (the helper + a call to it).
+        assert "_setup_action_notify" in source, (
+            "Adapter must define _setup_action_notify helper for the "
+            "registered callback. See Bug D fix design."
+        )
