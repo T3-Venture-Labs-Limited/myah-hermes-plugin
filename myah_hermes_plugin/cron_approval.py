@@ -1,5 +1,19 @@
 """Plugin-owned action confirmation primitives.
 
+⚠️ **DEAD CODE in production as of 2026-05-21.**
+
+This module is only called by ``myah_hermes_plugin.myah_tools.cron_tool``,
+which is itself not loaded in production (the plugin's entry point
+never imports it). Upstream's ``tools/cronjob_tools.py`` runs the
+cron tool in production and has no approval mechanism — so this
+confirmation primitive is currently inert.
+
+See ``docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md``
+(in the hosted repo) for the full root-cause analysis and
+re-activation recipe.
+
+------------------------------------------------------------------------
+
 Vendored from upstream's ``tools/approval.py`` (lines ~470-606).  The
 plugin maintains its own copy because upstream's ``cronjob_tools.py``
 imports ``request_action_confirmation`` directly from
@@ -156,43 +170,15 @@ def request_action_confirmation(
 
     session_key = _get_current_session_key()
 
-    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
-    # Bug D: in production, request_action_confirmation auto-approves
-    # silently because _registered_callbacks misses on lookup. Add INFO
-    # logging so we can see whether the registered key matches what the
-    # current session contextvar returns. Remove once the root cause is
-    # identified and a permanent fix is in place.
-    # ─────────────────────────────────────────────────────────────────────
+    # If no callback is bound, auto-approve and bail early.
     with _registered_callbacks_lock_proxy():
         callback = _registered_callbacks.get(session_key)
-        _registry_size = len(_registered_callbacks)
-        _registered_keys_sample = list(_registered_callbacks.keys())[:3]
-    log.info(
-        "[approval-diag] request_action_confirmation: action=%r session_key=%r "
-        "callback_found=%s registry_size=%d sample_registered=%r",
-        action_type,
-        session_key,
-        callback is not None,
-        _registry_size,
-        _registered_keys_sample,
-    )
-
-    # If no callback is bound, auto-approve and bail early.
     if callback is None:
-        log.info(
-            "[approval-diag] AUTO-APPROVE silent: action=%r session_key=%r — "
-            "user did NOT see approval card. Investigate key mismatch between "
-            "register site (adapter._setup_action_notify) and lookup site "
-            "(this function via _get_current_session_key contextvar).",
-            action_type,
+        log.debug(
+            "request_action_confirmation: no gateway callback for %r, auto-approve",
             session_key,
         )
         return "approve"
-    log.info(
-        "[approval-diag] DISPATCHING confirmation: action=%r session_key=%r",
-        action_type,
-        session_key,
-    )
 
     confirmation_id = str(uuid.uuid4())
     event = threading.Event()

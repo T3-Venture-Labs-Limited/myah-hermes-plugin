@@ -1,22 +1,113 @@
 """Tests for the Myah cron tool boundary validation.
 
-This module covers Bug G + Bug A regressions:
+⚠️ **IMPORTANT: This module is NOT loaded in production as of 2026-05-21.**
+
+The plugin's ``myah_hermes_plugin.myah_tools.cron_tool`` exists in
+source but is never imported by the plugin's entry point
+(``myah_hermes_plugin/myah_platform/__init__.py:register()``). Upstream
+Hermes' built-in ``tools/cronjob_tools.py`` is the cron tool that
+actually runs in production. See
+``docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md`` (in the
+hosted repo) for the full root-cause analysis.
+
+The tests below cover the plugin's vendored cron_tool fixes for:
 
 - **Bug G (2026-05-21):** the LLM passes a multi-line Python script body
-  as the ``script`` argument instead of a filename. The original
-  validator only rejected absolute paths and traversal — it accepted
-  content like ``#!/usr/bin/env python3\\nimport json...`` as if it were
-  a relative path, then the cron scheduler stored it as a "path" and
-  failed at runtime with ``Script not found:
-  /data/.hermes/scripts/#!/usr/bin/env python3\\nimport json...``.
+  as the ``script`` argument instead of a filename. The plugin's
+  enhanced validator rejects ``#!/usr/bin/env python3\\nimport json...``.
+  Upstream's validator only catches absolute paths + traversal — so
+  the production bug recurs even though these tests pass.
 
 - **Bug A (2026-05-21):** one-cron-per-chat constraint and
-  deliver-target redaction in ``cronjob list`` output (added in a
-  later test class in this file).
+  deliver-target redaction. Plugin enforces both; upstream does
+  neither — so the production behavior is unchanged even though
+  these tests pass.
+
+These tests document the design intent. If we ever restore the
+plugin shadow (Path B in the gotcha doc), they instantly become
+active regression gates. For now they pass against the plugin source
+but the user-visible bugs persist in production.
+
+The single integration-style test
+``TestPluginCronToolLoadStatus`` below pins the current
+"plugin cron_tool NOT loaded by entry point" state so the situation
+is visible from the test suite without requiring spelunking through
+``sys.modules`` at runtime.
 """
 from __future__ import annotations
 
 import pytest
+
+
+# ── Architectural characterization: plugin cron_tool load status ───────────
+
+
+class TestPluginCronToolLoadStatus:
+    """Captures the current architectural state (2026-05-21): the plugin's
+    vendored ``cron_tool`` is in source but NOT loaded by the plugin's
+    entry point. If this test ever fails (because someone restored the
+    shadow), update ``docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md``
+    and delete this characterization test.
+    """
+
+    @staticmethod
+    def _read_file_source(module) -> str:
+        """Read a module's source file directly. Avoids ``inspect.getsource``
+        which doesn't work for ``__init__`` modules whose top-level name
+        is a method-wrapper."""
+        from pathlib import Path
+
+        path = Path(module.__file__)
+        return path.read_text(encoding="utf-8")
+
+    def test_plugin_entry_point_does_not_import_cron_tool(self):
+        """The plugin's ``myah_platform/__init__.py:register()`` MUST NOT
+        import ``cron_tool`` today. Importing it would activate the
+        plugin's shadow over upstream's cronjob tool — which is fine
+        as a deliberate decision (Path B in the gotcha doc), but
+        requires re-evaluating the maintenance/upstream-PR trade-offs
+        first.
+
+        Source-text check rather than ``sys.modules`` introspection
+        because import-side-effects from test fixtures could pollute
+        the latter.
+        """
+        from myah_hermes_plugin import myah_platform
+
+        source = self._read_file_source(myah_platform)
+        # Must not contain any form of importing the cron_tool module.
+        forbidden = (
+            "from ..myah_tools import cron_tool",
+            "from myah_hermes_plugin.myah_tools import cron_tool",
+            "import myah_hermes_plugin.myah_tools.cron_tool",
+        )
+        for forbidden_import in forbidden:
+            assert forbidden_import not in source, (
+                f"Plugin entry point now imports cron_tool ({forbidden_import!r}). "
+                f"This activates the plugin shadow over upstream's cronjob tool — "
+                f"a deliberate architectural choice. If intentional: update "
+                f"docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md "
+                f"(in the hosted repo) and delete this characterization test. "
+                f"If accidental: revert the import."
+            )
+
+    def test_plugin_myah_tools_init_does_not_import_cron_tool(self):
+        """The package init ``myah_tools/__init__.py`` MUST stay empty of
+        side-effect imports for cron_tool. Same rationale as above —
+        importing here would also activate the shadow."""
+        from myah_hermes_plugin import myah_tools
+
+        source = self._read_file_source(myah_tools)
+        forbidden = (
+            "from . import cron_tool",
+            "from .cron_tool",
+            "import cron_tool",
+        )
+        for forbidden_import in forbidden:
+            assert forbidden_import not in source, (
+                f"myah_tools package now imports cron_tool ({forbidden_import!r}). "
+                f"See docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md."
+            )
 
 
 # ── Bug G: script-body-as-path validation ───────────────────────────────────
