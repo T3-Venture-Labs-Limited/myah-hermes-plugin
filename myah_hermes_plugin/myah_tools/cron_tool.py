@@ -1,18 +1,44 @@
 """
-Plugin-owned cron job management tool (shadows upstream tools/cronjob_tools.py).
+Plugin-owned cron job management tool (intended to shadow upstream
+``tools/cronjob_tools.py``).
+
+⚠️ **DEAD CODE in production as of 2026-05-21.**
 
 This module is a vendored copy of upstream's ``tools/cronjob_tools.py``
-with the single change of importing ``request_action_confirmation``
-from the plugin-vendored ``myah_hermes_plugin.cron_approval`` instead
-of upstream's ``tools.approval``.  Doing so keeps the entire approval
-chain inside the plugin so Tier 2A's "plugin works on stock upstream"
-goal holds.
+with plugin-side enhancements (approval card via
+``request_action_confirmation``, one-cron-per-chat constraint,
+multi-line script-body rejection, deliver UUID redaction).
 
-Tool registration uses the same ``cronjob`` name as upstream — the
-plugin's import order causes its ``registry.register`` call to land
-last, so the plugin's handler wins (last-writer-wins on tool name).
+**It is NOT loaded by the plugin's entry point.** The plugin's
+``myah_platform/__init__.py:register()`` never imports it. Upstream's
+``tools/cronjob_tools.py`` is the cron tool that actually runs in
+production. The fixes herein (Bug D approval card, Bug A one-per-chat
+constraint + UUID redaction, Bug G script-body validation) are
+therefore inert until/unless the shadow is restored.
 
-Spec: docs/superpowers/specs/2026-05-06-myah-oss-completion-design.md
+**To re-activate** (Path B in the gotcha doc): see the recipe in
+``docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md`` (in the
+hosted repo). Roughly:
+
+1. Add ``from ..myah_tools import cron_tool`` at the top of
+   ``myah_platform/__init__.py``.
+2. Change the bottom ``registry.register(...)`` call here to add
+   ``override=True``.
+3. Add ``'myah_hermes_plugin.myah_tools.cron_tool'`` to the
+   Dockerfile.stock build-time import contract.
+4. Update the characterization tests in ``tests/test_cron_tool.py::
+   TestPluginCronToolLoadStatus``.
+
+**Why deferred (2026-05-21):** restoring the shadow adds long-term
+maintenance burden (every upstream cronjob change requires re-port).
+The user-visible bugs are mitigated by (a) the LLM-initiated nature
+of cron creation (explicit user intent each time) and (b) the
+platform's Tasks UI letting users review/pause/delete crons after
+the fact.
+
+Original (pre-deferral) intent docs preserved below for the future
+re-activation: spec at
+``docs/superpowers/specs/2026-05-06-myah-oss-completion-design.md``
 §3 Task 2A.2.2.
 
 Expose a single compressed action-oriented tool to avoid schema/context bloat.

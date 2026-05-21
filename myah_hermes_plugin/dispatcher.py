@@ -1,5 +1,16 @@
 """Plugin-vendored approval-notify dispatcher.
 
+⚠️ **DEAD CODE in production as of 2026-05-21.**
+
+This dispatcher is only used by
+``myah_hermes_plugin.cron_approval.request_action_confirmation``,
+which is only called by the plugin's ``cron_tool.py``, which is not
+loaded in production. See
+``docs/gotchas/2026-05-21-plugin-cron-tool-not-loaded.md``
+(in the hosted repo).
+
+------------------------------------------------------------------------
+
 Vendored from upstream's ``gateway/run.py:_dispatch_approval_notify``
 (~lines 334-460). The plugin owns its own copy because upstream's
 notify chain is the only transport from ``request_action_confirmation``

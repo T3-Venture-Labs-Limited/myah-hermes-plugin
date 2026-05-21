@@ -179,7 +179,13 @@ class TestCronJobIdRecovery:
     @pytest.mark.asyncio
     async def test_send_picks_most_recent_when_multiple_jobs_match(self, monkeypatch):
         """Multiple jobs share the same chat_id → take the one with the
-        most recent ``last_run_at``."""
+        most recent ``last_run_at``.
+
+        Note: post-Bug-F (#8), the chat_id-based jobs.json fallback only
+        fires when ``metadata`` contains a cron-context signal (``thread_id``
+        et al.). Pass ``thread_id`` to simulate the cron scheduler's call
+        shape.
+        """
         adapter = _make_adapter()
         adapter._loop = asyncio.get_running_loop()
 
@@ -212,7 +218,7 @@ class TestCronJobIdRecovery:
             await adapter.send(
                 _CHAT_ID,
                 "tie-breaker content",
-                metadata={},
+                metadata={"thread_id": "thr-recency"},
             )
 
         assert recorder.posts
@@ -328,10 +334,12 @@ class TestCronJobIdRecovery:
             return_value=[never_run, recently_run],
         ), patch("aiohttp.ClientSession", return_value=recorder):
             # Must NOT raise TypeError.
+            # thread_id passed because post-Bug-F (#8) the jobs.json fallback
+            # only fires when cron-context metadata is present.
             await adapter.send(
                 _CHAT_ID,
                 "iso-vs-none content",
-                metadata={},
+                metadata={"thread_id": "thr-tiebreak-none"},
             )
 
         assert recorder.posts, "webhook was not invoked — recovery silently failed"
@@ -376,7 +384,11 @@ class TestCronJobIdRecovery:
             "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
             return_value=[older, newer],
         ), patch("aiohttp.ClientSession", return_value=recorder):
-            await adapter.send(_CHAT_ID, "two-iso content", metadata={})
+            # thread_id passed because post-Bug-F (#8) the jobs.json fallback
+            # only fires when cron-context metadata is present.
+            await adapter.send(
+                _CHAT_ID, "two-iso content", metadata={"thread_id": "thr-tiebreak-iso"},
+            )
 
         assert recorder.posts
         body = recorder.posts[0]["json"]
