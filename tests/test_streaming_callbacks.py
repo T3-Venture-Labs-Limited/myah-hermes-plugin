@@ -137,6 +137,138 @@ def test_hook_handles_dict_cache_entry():
     assert fake_agent.stream_delta_callback is not None
 
 
+def test_hook_resolves_chat_id_via_session_context_when_arg_is_internal_id():
+    """Regression test (H1, 2026-05-21): upstream Hermes' pre_llm_call
+    contract changed — ``session_id`` arg is now an internal session
+    marker (timestamp + random hex like ``20260521_044539_f022aaeb``),
+    NOT the chat_id. The hook must fall back to reading
+    ``HERMES_SESSION_CHAT_ID`` from the upstream session contextvar.
+
+    Without this fallback, every production message bailed at
+    ``session-key-miss``, Phase F never installed structured callbacks,
+    and the user saw "Thinking..." → instant final-response (vanilla
+    adapter.send) instead of streaming.
+
+    Verified in production 2026-05-21 04:45 UTC via diagnostic plugin
+    SHA 9e150dc: ``session_id='20260521_044539_f022aaeb'`` vs.
+    ``sample_keys=['ca5ecc16-8f95-4076-8267-3218363dcc27']``.
+    """
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:ca5ecc16-8f95-4076-8267-3218363dcc27:user-1"
+    real_chat_id = "ca5ecc16-8f95-4076-8267-3218363dcc27"
+    internal_session_marker = "20260521_044539_f022aaeb"
+
+    adapter, structured = _make_fake_adapter(session_key=sk)
+    # Adapter stored chat_id → session_key (matches production state).
+    adapter._chat_id_session_keys = {real_chat_id: sk}
+
+    fake_agent = _make_fake_agent()
+    runner = MagicMock()
+    runner._agent_cache = {sk: (fake_agent, "sig")}
+    adapter.gateway_runner = runner
+    adapter._resolve_runner.return_value = runner
+
+    # Simulate the upstream contextvar resolution returning the chat_id.
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ), patch.object(
+        streaming_callbacks,
+        "_read_chat_id_from_session_context",
+        return_value=real_chat_id,
+    ):
+        result = streaming_callbacks.myah_pre_llm_call(
+            session_id=internal_session_marker,  # NOT the chat_id
+            platform="myah",
+        )
+
+    assert result is None
+    # The whole point: structured callbacks WERE installed even though
+    # session_id was the internal marker, not the chat_id.
+    assert fake_agent.stream_delta_callback is structured["stream_delta"]
+    assert fake_agent.tool_progress_callback is structured["tool_progress"]
+    assert sk in adapter._native_streaming_used
+
+
+def test_post_llm_call_resolves_chat_id_via_session_context_when_arg_is_internal_id():
+    """Mirror of test_hook_resolves_chat_id_via_session_context_when_arg_is_internal_id
+    for the post_llm_call hook. Both hooks share the resolution helper, so
+    both must benefit from the fix.
+    """
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:ca5ecc16-8f95-4076-8267-3218363dcc27:user-1"
+    real_chat_id = "ca5ecc16-8f95-4076-8267-3218363dcc27"
+    internal_session_marker = "20260521_044539_f022aaeb"
+
+    adapter, _ = _make_fake_adapter(session_key=sk)
+    adapter._chat_id_session_keys = {real_chat_id: sk}
+    adapter._session_streams = {sk: "stream-abc"}
+    adapter._stream_delta_invoked = set()  # streaming did NOT fire
+    pushed = []
+    adapter._push_event_sync = lambda sid, ev: pushed.append((sid, ev))
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ), patch.object(
+        streaming_callbacks,
+        "_read_chat_id_from_session_context",
+        return_value=real_chat_id,
+    ):
+        result = streaming_callbacks.myah_post_llm_call(
+            session_id=internal_session_marker,
+            platform="myah",
+            assistant_response="here is the answer",
+        )
+
+    assert result is None
+    assert len(pushed) == 1, (
+        "post_llm_call must emit the synthetic delta when streaming "
+        "didn't fire, even when session_id is the internal marker"
+    )
+
+
+def test_resolve_session_key_prefers_chat_id_arg_when_match_exists():
+    """Backward-compat: if session_id_arg IS the chat_id (legacy upstream
+    or test fixtures), the fast path returns the session_key directly
+    without touching the contextvar."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    adapter = MagicMock()
+    adapter._chat_id_session_keys = {"chat-1": "session-key-1"}
+
+    # Force the contextvar fallback to raise if called — it must NOT
+    # be invoked when the fast path matches.
+    with patch.object(
+        streaming_callbacks,
+        "_read_chat_id_from_session_context",
+        side_effect=AssertionError("contextvar fallback should not run on fast path"),
+    ):
+        sk = streaming_callbacks._resolve_session_key_for_hook(adapter, "chat-1")
+
+    assert sk == "session-key-1"
+
+
+def test_resolve_session_key_returns_empty_when_both_paths_fail():
+    """Defense: when neither the arg nor the contextvar produces a hit,
+    return empty string so the caller bails cleanly."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    adapter = MagicMock()
+    adapter._chat_id_session_keys = {"some-other-chat": "some-other-sk"}
+
+    with patch.object(
+        streaming_callbacks,
+        "_read_chat_id_from_session_context",
+        return_value="",
+    ):
+        sk = streaming_callbacks._resolve_session_key_for_hook(
+            adapter, "unknown-marker"
+        )
+
+    assert sk == ""
+
+
 def test_hook_falls_back_to_gateway_runner_attr_when_resolve_missing():
     """If MyahAdapter is older and lacks _resolve_runner, the hook must still
     work by reading the legacy ``gateway_runner`` attribute directly."""

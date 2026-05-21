@@ -156,38 +156,15 @@ def request_action_confirmation(
 
     session_key = _get_current_session_key()
 
-    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
-    # Surface every auto-approve at INFO so we can tell whether the
-    # approval card actually fires for the user, or silently skips.
-    # ─────────────────────────────────────────────────────────────────────
+    # If no callback is bound, auto-approve and bail early.
     with _registered_callbacks_lock_proxy():
         callback = _registered_callbacks.get(session_key)
-        _registered_size = len(_registered_callbacks)
-        _registered_sample = list(_registered_callbacks.keys())[:3]
-    log.info(
-        "[approval-diag] request_action_confirmation: action=%r session_key=%r "
-        "callback_found=%s registry_size=%d sample_keys=%r",
-        action_type,
-        session_key,
-        callback is not None,
-        _registered_size,
-        _registered_sample,
-    )
-
-    # If no callback is bound, auto-approve and bail early.
     if callback is None:
-        log.info(
-            "[approval-diag] AUTO-APPROVE: no gateway callback for session_key=%r "
-            "action=%r — user did NOT see approval card",
+        log.debug(
+            "request_action_confirmation: no gateway callback for %r, auto-approve",
             session_key,
-            action_type,
         )
         return "approve"
-    log.info(
-        "[approval-diag] DISPATCHING confirmation card: session_key=%r action=%r",
-        session_key,
-        action_type,
-    )
 
     confirmation_id = str(uuid.uuid4())
     event = threading.Event()
