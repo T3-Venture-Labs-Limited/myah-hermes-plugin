@@ -156,15 +156,43 @@ def request_action_confirmation(
 
     session_key = _get_current_session_key()
 
-    # If no callback is bound, auto-approve and bail early.
+    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
+    # Bug D: in production, request_action_confirmation auto-approves
+    # silently because _registered_callbacks misses on lookup. Add INFO
+    # logging so we can see whether the registered key matches what the
+    # current session contextvar returns. Remove once the root cause is
+    # identified and a permanent fix is in place.
+    # ─────────────────────────────────────────────────────────────────────
     with _registered_callbacks_lock_proxy():
         callback = _registered_callbacks.get(session_key)
+        _registry_size = len(_registered_callbacks)
+        _registered_keys_sample = list(_registered_callbacks.keys())[:3]
+    log.info(
+        "[approval-diag] request_action_confirmation: action=%r session_key=%r "
+        "callback_found=%s registry_size=%d sample_registered=%r",
+        action_type,
+        session_key,
+        callback is not None,
+        _registry_size,
+        _registered_keys_sample,
+    )
+
+    # If no callback is bound, auto-approve and bail early.
     if callback is None:
-        log.debug(
-            "request_action_confirmation: no gateway callback for %r, auto-approve",
+        log.info(
+            "[approval-diag] AUTO-APPROVE silent: action=%r session_key=%r — "
+            "user did NOT see approval card. Investigate key mismatch between "
+            "register site (adapter._setup_action_notify) and lookup site "
+            "(this function via _get_current_session_key contextvar).",
+            action_type,
             session_key,
         )
         return "approve"
+    log.info(
+        "[approval-diag] DISPATCHING confirmation: action=%r session_key=%r",
+        action_type,
+        session_key,
+    )
 
     confirmation_id = str(uuid.uuid4())
     event = threading.Event()

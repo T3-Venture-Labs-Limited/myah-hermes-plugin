@@ -814,3 +814,176 @@ class TestActionNotifyRegistration:
             "Adapter must define _setup_action_notify helper for the "
             "registered callback. See Bug D fix design."
         )
+
+
+# ── Bug F: adapter.send must NOT misclassify regular replies as cron ──────
+
+
+class TestAdapterSendCronClassification:
+    """Regression tests (2026-05-21) for Bug F production root cause.
+
+    `adapter.send`'s "Cron Path A" recovery had two signals:
+      1. Session contextvar (`_recover_cron_job_id_from_session_key`)
+      2. jobs.json lookup by `chat_id` ← THE BUG
+
+    Signal #2 fired whenever the chat had ANY existing cron, regardless of
+    whether the current adapter.send call was actually from the cron
+    scheduler. Result: the gateway's regular final `adapter.send(chat_id,
+    response)` after an LLM turn that created a cron was misclassified as
+    a cron delivery — both live-preview SSE push AND webhook fired, both
+    delivering the SAME content to the chat. The user saw the LLM reply
+    rendered twice.
+
+    Phase F suppression at lines ~2277 NEVER reached because the cron
+    branch returns BEFORE the suppression check.
+
+    Verified empirically 2026-05-21 14:30 UTC: chat `4cbe2103…` after
+    cron creation had `content` and `output[2].message.content` both
+    containing the LLM response TWICE (≈770 chars vs gateway's 374
+    response).
+    """
+
+    @pytest.mark.asyncio
+    async def test_regular_reply_with_existing_cron_in_chat_does_not_misclassify(
+        self, monkeypatch,
+    ):
+        """Regular gateway reply (no metadata) must not get classified as
+        cron just because the chat has a cron in jobs.json."""
+        from unittest.mock import patch
+
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        chat_id = "test-chat-with-existing-cron"
+        session_key = "agent:main:myah:dm:test-chat-with-existing-cron"
+        stream_id = "test-stream-bug-f"
+
+        adapter._chat_id_streams[chat_id] = stream_id
+        adapter._session_streams[session_key] = stream_id
+        adapter._chat_id_session_keys[chat_id] = session_key
+        adapter._native_streaming_used.add(session_key)  # Phase F fired
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._streams[stream_id] = q
+
+        # Simulate jobs.json having a cron for this chat.
+        with patch(
+            "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
+            return_value=[
+                {
+                    "id": "existing-cron-id",
+                    "name": "Existing cron",
+                    "origin": {"platform": "myah", "chat_id": chat_id},
+                    "last_run_at": "2026-05-21T06:00:00+00:00",
+                }
+            ],
+        ):
+            result = await adapter.send(
+                chat_id,
+                "Final LLM response confirming cron creation",
+                reply_to=None,
+                metadata=None,  # ← regular reply, no metadata
+            )
+
+        # Phase F suppression should engage; result.success True with the
+        # specific suppression message_id. If the cron-path misclassifier
+        # fires, this returns webhook results instead.
+        assert result.success is True
+        assert result.message_id == "suppressed-native-streaming", (
+            f"Regular chat reply was misclassified as cron delivery, "
+            f"bypassing Phase F suppression. Result: {result}. "
+            f"Production duplicate-output bug recurs."
+        )
+        # And: NO message.delta should have been pushed (suppressed).
+        # Drain queue to verify.
+        assert q.empty(), (
+            f"Phase F suppression should have prevented any push, but "
+            f"queue contains: {q.qsize()} item(s) — duplicate path fired."
+        )
+
+    @pytest.mark.asyncio
+    async def test_cron_scheduler_call_with_thread_id_still_routes_to_webhook(
+        self, monkeypatch,
+    ):
+        """Sanity: when the cron scheduler calls adapter.send with cron-
+        context metadata (thread_id), the recovery still fires correctly
+        and the cron path runs. This preserves the "test it here"
+        functionality from Bug D-v4 (2026-04-25)."""
+        from unittest.mock import patch, AsyncMock
+
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        chat_id = "test-chat-cron-scheduler"
+        adapter._chat_id_streams[chat_id] = "test-stream-cs"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._streams["test-stream-cs"] = q
+
+        # Stub webhook to avoid hitting network.
+        adapter._send_via_webhook = AsyncMock(
+            return_value=__import__(
+                "myah_hermes_plugin.myah_platform.adapter",
+                fromlist=["SendResult"],
+            ).SendResult(success=True, message_id="webhook-ok")
+        )
+
+        with patch(
+            "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
+            return_value=[
+                {
+                    "id": "existing-cron-id",
+                    "name": "Existing cron",
+                    "origin": {"platform": "myah", "chat_id": chat_id},
+                    "last_run_at": "2026-05-21T06:00:00+00:00",
+                }
+            ],
+        ):
+            result = await adapter.send(
+                chat_id,
+                "Cron output content",
+                reply_to=None,
+                metadata={"thread_id": "thread-123"},  # cron scheduler shape
+            )
+
+        # Webhook path should have engaged.
+        assert result.success is True
+        adapter._send_via_webhook.assert_called_once()
+        # Live-preview push fires too (best-effort decoration).
+        assert q.qsize() == 1, "Cron path should have pushed a live preview"
+
+    @pytest.mark.asyncio
+    async def test_regular_reply_no_cron_in_chat_still_goes_to_sse(self):
+        """Baseline: when no cron exists for the chat, regular replies
+        flow through the live SSE path normally."""
+        from unittest.mock import patch
+
+        adapter = _make_adapter()
+        adapter._loop = asyncio.get_running_loop()
+
+        chat_id = "test-chat-no-cron"
+        session_key = "agent:main:myah:dm:test-chat-no-cron"
+        stream_id = "test-stream-no-cron"
+
+        adapter._chat_id_streams[chat_id] = stream_id
+        adapter._session_streams[session_key] = stream_id
+        adapter._chat_id_session_keys[chat_id] = session_key
+        # No native streaming used (no Phase F for this test).
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._streams[stream_id] = q
+
+        with patch(
+            "myah_hermes_plugin.myah_platform.adapter._load_cron_jobs_safely",
+            return_value=[],  # no crons
+        ):
+            result = await adapter.send(
+                chat_id,
+                "Hello user",
+                reply_to=None,
+                metadata=None,
+            )
+
+        assert result.success is True
+        # One push to SSE.
+        assert q.qsize() == 1
+        event = q.get_nowait()
+        assert event["event"] == "message.delta"
+        assert event["delta"] == "Hello user"
