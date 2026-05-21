@@ -107,14 +107,26 @@ def myah_pre_llm_call(
     Hooks may return a ``{"context": str}`` dict to inject extra context
     into the user message, but we don't use that — we return ``None``.
     """
+    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
+    # Tier 1: surface every bailout in this hook at INFO so production
+    # logs reveal which check is failing. Promote-then-revert pattern:
+    # once root cause is identified, revert this commit and ship the
+    # targeted fix.
+    # ─────────────────────────────────────────────────────────────────────
+    logger.info(
+        "[streaming-diag] pre_llm_call entry: platform=%r session_id=%r kwargs_keys=%r",
+        platform,
+        session_id,
+        sorted(kwargs.keys()) if kwargs else [],
+    )
+
     if platform != "myah":
+        logger.info("[streaming-diag] BAIL@platform-mismatch: platform=%r", platform)
         return None
 
     adapter = _get_latest_adapter()
     if adapter is None:
-        logger.debug(
-            "[myah-streaming] pre_llm_call fired but no MyahAdapter active"
-        )
+        logger.info("[streaming-diag] BAIL@adapter-none: _LATEST_ADAPTER is None")
         return None
 
     # Use the adapter's lazy runner self-discovery instead of reading
@@ -126,14 +138,16 @@ def myah_pre_llm_call(
     if callable(_resolve):
         try:
             runner = _resolve()
-        except Exception:
+        except Exception as _exc:
+            logger.info("[streaming-diag] _resolve_runner raised: %s", _exc)
             runner = None
     else:
         # Older MyahAdapter without _resolve_runner — fall back to attr read
         # so a partially upgraded plugin still degrades gracefully.
         runner = getattr(adapter, "gateway_runner", None)
+        logger.info("[streaming-diag] adapter has no _resolve_runner; fallback runner=%r", runner)
     if runner is None:
-        logger.debug("[myah-streaming] no GatewayRunner available")
+        logger.info("[streaming-diag] BAIL@runner-none: no GatewayRunner available")
         return None
 
     chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
@@ -141,15 +155,35 @@ def myah_pre_llm_call(
     if not session_key:
         # Likely a session that wasn't initiated through
         # _handle_message_endpoint (e.g. internal subagent run). Skip.
+        logger.info(
+            "[streaming-diag] BAIL@session-key-miss: session_id=%r not in "
+            "_chat_id_session_keys (size=%d, sample_keys=%r)",
+            session_id,
+            len(chat_session_keys),
+            list(chat_session_keys.keys())[:3],
+        )
         return None
+    logger.info(
+        "[streaming-diag] session-key-hit: session_id=%r → session_key=%r",
+        session_id,
+        session_key,
+    )
 
     cache = getattr(runner, "_agent_cache", {}) or {}
     cached = cache.get(session_key)
     if not cached:
-        logger.debug(
-            "[myah-streaming] no cached agent for session_key=%s", session_key,
+        logger.info(
+            "[streaming-diag] BAIL@cache-miss: session_key=%r not in "
+            "runner._agent_cache (size=%d, sample_keys=%r)",
+            session_key,
+            len(cache),
+            list(cache.keys())[:3],
         )
         return None
+    logger.info(
+        "[streaming-diag] cache-hit: cached_type=%s",
+        type(cached).__name__,
+    )
     # The cache stores (agent, sig) tuples in vanilla. Be defensive:
     # if shape ever changes to a bare agent, handle that too.
     agent = cached[0] if isinstance(cached, tuple) else cached
@@ -158,12 +192,20 @@ def myah_pre_llm_call(
         cbs = adapter.get_structured_callbacks(session_key)
     except Exception:
         logger.exception(
-            "[myah-streaming] adapter.get_structured_callbacks raised for %s",
+            "[streaming-diag] BAIL@get_structured_callbacks-raised for %s",
             session_key,
         )
         return None
     if not cbs:
+        logger.info(
+            "[streaming-diag] BAIL@cbs-empty: get_structured_callbacks returned %r",
+            cbs,
+        )
         return None
+    logger.info(
+        "[streaming-diag] cbs-ready: keys=%r",
+        sorted(cbs.keys()),
+    )
 
     # Mutate the agent's callback attributes. AIAgent reads these at
     # call time (not at construction time), so the imminent LLM call
@@ -192,6 +234,10 @@ def myah_pre_llm_call(
 
     logger.info(
         "[myah-streaming] structured callbacks installed for session=%s",
+        session_key,
+    )
+    logger.info(
+        "[streaming-diag] SUCCESS: callbacks installed; native_streaming_used += %r",
         session_key,
     )
     return None
@@ -257,18 +303,35 @@ def myah_post_llm_call(
 
     Returns None so this hook never affects ``final_response``.
     """
+    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
+    logger.info(
+        "[streaming-diag] post_llm_call entry: platform=%r session_id=%r "
+        "assistant_response_len=%d",
+        platform,
+        session_id,
+        len(assistant_response or ""),
+    )
+
     if platform != "myah":
         return None
     if not assistant_response:
+        logger.info("[streaming-diag] post_llm_call: empty assistant_response — no-op")
         return None
 
     adapter = _get_latest_adapter()
     if adapter is None:
+        logger.info("[streaming-diag] post_llm_call BAIL@adapter-none")
         return None
 
     chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
     session_key = chat_session_keys.get(session_id)
     if not session_key:
+        logger.info(
+            "[streaming-diag] post_llm_call BAIL@session-key-miss: session_id=%r "
+            "(map_size=%d)",
+            session_id,
+            len(chat_session_keys),
+        )
         return None
 
     stream_invoked = getattr(adapter, "_stream_delta_invoked", None)
@@ -276,12 +339,22 @@ def myah_post_llm_call(
         # _stream_delta_invoked not initialized — likely a partially
         # upgraded plugin. Skip the surface-response logic; existing
         # streaming behavior unchanged.
+        logger.info("[streaming-diag] post_llm_call BAIL@stream_invoked-None")
         return None
 
     if session_key in stream_invoked:
         # Streaming actually fired — the user has already seen the
         # response token-by-token. Nothing to do.
+        logger.info(
+            "[streaming-diag] post_llm_call: streaming-happy-path session=%r",
+            session_key,
+        )
         return None
+    logger.info(
+        "[streaming-diag] post_llm_call: streaming-DID-NOT-fire session=%r, "
+        "will surface response",
+        session_key,
+    )
 
     # No streaming happened. The gateway is about to suppress the
     # final send. Surface the response ourselves so the user sees
