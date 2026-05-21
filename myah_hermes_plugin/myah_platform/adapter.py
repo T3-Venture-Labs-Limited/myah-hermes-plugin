@@ -496,6 +496,17 @@ class MyahAdapter(BasePlatformAdapter):
         """
         from myah_hermes_plugin.dispatcher import register_gateway_notify
 
+        # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────
+        # Log at INFO so we can correlate the registered key with the
+        # lookup-time key from cron_approval.request_action_confirmation.
+        # Remove once Bug D approval card is confirmed working in prod.
+        # ─────────────────────────────────────────────────────────────────
+        logger.info(
+            "[approval-diag] _setup_action_notify: registering callback for "
+            "session_key=%r stream_id=%r",
+            session_key, stream_id,
+        )
+
         # Capture in closure: session_key + stream_id are stable for this
         # session lifecycle; the dispatcher may invoke the callback multiple
         # times (one per approval request) before unregister fires.
@@ -507,6 +518,13 @@ class MyahAdapter(BasePlatformAdapter):
             Three-arity shape matches the modern dispatcher contract
             (see ``myah_hermes_plugin.dispatcher._dispatch_approval_notify``).
             """
+            logger.info(
+                "[approval-diag] _action_notify FIRED: session_key=%r "
+                "action_type=%r confirmation_id=%r",
+                _sk,
+                payload.get('action_type'),
+                payload.get('confirmation_id'),
+            )
             self._push_event(_captured_stream_id, {
                 'event': 'tool.confirmation_required',
                 'stream_id': _captured_stream_id,
@@ -2203,7 +2221,24 @@ class MyahAdapter(BasePlatformAdapter):
                 else:
                     meta.setdefault("job_name", recovered_job_id)
                 is_cron_delivery = True
-            elif chat_id:
+            elif chat_id and (
+                # Bug F fix (2026-05-21): the chat_id-based fallback was
+                # firing for REGULAR gateway LLM replies whenever the chat
+                # had any existing cron, causing the reply to be routed
+                # through the cron-webhook path AND live-preview push,
+                # duplicating the assistant message visible to the user.
+                #
+                # The cron scheduler ALWAYS passes some cron-context
+                # metadata (``thread_id`` at minimum — see
+                # ``cron/scheduler.py:_deliver_result``). Regular gateway
+                # final-response sends pass no metadata. Gate the
+                # jobs.json fallback on the presence of a cron-context
+                # signal in metadata so regular replies bypass it.
+                meta.get("thread_id")
+                or meta.get("job_name")
+                or meta.get("origin")
+                or meta.get("ran_at")
+            ):
                 # No session signal — try jobs.json lookup by chat_id.
                 matches = [
                     j for j in _load_cron_jobs_safely()
