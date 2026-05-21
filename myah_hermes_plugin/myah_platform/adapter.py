@@ -469,6 +469,58 @@ class MyahAdapter(BasePlatformAdapter):
         except RuntimeError:
             pass  # Event loop closed
 
+    def _setup_action_notify(self, session_key: str, stream_id: str) -> None:
+        """Register the plugin-side action-confirmation notify callback.
+
+        Bug D fix (2026-05-21). The plugin's ``cron_approval.request_action_confirmation``
+        looks up ``_registered_callbacks[session_key]`` to decide whether to
+        emit a ``tool.confirmation_required`` SSE event or auto-approve silently.
+        Without a production code path that calls ``register_gateway_notify``,
+        the registry was always empty in production — every cron-creation
+        auto-approved silently, and the user never saw the approval card.
+
+        This mirrors the upstream pattern at ``gateway/run.py:14188-14226``
+        but for the plugin's separate ``_registered_callbacks`` dict (the
+        cron-approval payload shape differs from upstream's exec-approval
+        shape, so the registries are intentionally split).
+
+        The callback is called synchronously by ``_dispatch_approval_notify``
+        from the agent's tool-runner thread; we push the event via the
+        thread-safe ``_push_event`` (which schedules a put via
+        ``call_soon_threadsafe``).
+
+        Paired with the existing ``unregister_gateway_notify`` calls at
+        :func:`_sweep_orphaned_streams` (line ~1741) and :func:`disconnect`
+        (line ~2029) — those cleanup paths already exist; the original bug
+        was the missing register half.
+        """
+        from myah_hermes_plugin.dispatcher import register_gateway_notify
+
+        # Capture in closure: session_key + stream_id are stable for this
+        # session lifecycle; the dispatcher may invoke the callback multiple
+        # times (one per approval request) before unregister fires.
+        _captured_stream_id = stream_id
+
+        def _action_notify(_sk: str, payload: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> None:
+            """Forward a tool.confirmation_required payload to the SSE stream.
+
+            Three-arity shape matches the modern dispatcher contract
+            (see ``myah_hermes_plugin.dispatcher._dispatch_approval_notify``).
+            """
+            self._push_event(_captured_stream_id, {
+                'event': 'tool.confirmation_required',
+                'stream_id': _captured_stream_id,
+                'run_id': _captured_stream_id,
+                'timestamp': time.time(),
+                'confirmation_id': payload.get('confirmation_id', ''),
+                'action_type': payload.get('action_type', 'confirmation'),
+                'description': payload.get('description', ''),
+                'options': payload.get('options') or ['approve', 'deny'],
+                'metadata': payload.get('metadata') or (metadata or {}),
+            })
+
+        register_gateway_notify(session_key, _action_notify)
+
     def _push_event_sync(self, stream_id: str, event: Dict[str, Any]) -> None:
         """Direct push — only safe from the event loop thread."""
         q = self._streams.get(stream_id)
@@ -745,6 +797,13 @@ class MyahAdapter(BasePlatformAdapter):
         self._chat_id_streams[session_id] = stream_id
         self._session_streams[session_key] = stream_id
         self._stream_sessions[stream_id] = session_key
+
+        # Bug D fix (2026-05-21): register the plugin-side action-confirmation
+        # notify callback so cron-creation approvals reach the user.
+        # request_action_confirmation auto-approves silently when
+        # _registered_callbacks is empty; we populate it here, paired with
+        # the existing unregister at _sweep_orphaned_streams and disconnect.
+        self._setup_action_notify(session_key, stream_id)
 
         # ── Myah: media attachments ingestion ──────────────────────────────
         attachments = body.get('attachments') or []

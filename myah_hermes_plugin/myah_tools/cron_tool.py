@@ -181,6 +181,35 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     raw = script.strip()
 
+    # ── Bug G fix (2026-05-21): reject script-body content ─────────────────
+    # The LLM sometimes passes the script *body* (a full Python source with
+    # shebang, imports, etc.) instead of a filename. Production occurrence:
+    # job 775f9c441d66 'Hourly random dog picture' stored the body as a
+    # path, then runtime emitted
+    # ``Script not found: /data/.hermes/scripts/#!/usr/bin/env python3...``.
+    #
+    # Detect three unambiguous content signals:
+    #   1. starts with ``#!`` (shebang) — never a filename
+    #   2. contains a newline — never a filename
+    #   3. contains a NUL byte — never a POSIX filename
+    if raw.startswith("#!"):
+        return (
+            "The 'script' argument expects a FILENAME inside ~/.hermes/scripts/, "
+            f"not script content. Got a shebang-prefixed string. "
+            f"To inline a script, save it to ~/.hermes/scripts/<name>.py first "
+            f"(via the filesystem tool), then pass just the filename."
+        )
+    if "\n" in raw or "\r" in raw:
+        return (
+            "The 'script' argument expects a single FILENAME inside "
+            "~/.hermes/scripts/, not multi-line content. "
+            "Save the script content to ~/.hermes/scripts/<name>.py first "
+            "(via the filesystem tool), then pass just the filename."
+        )
+    if "\x00" in raw:
+        return "Script filename contains a NUL byte, which is never valid."
+    # ────────────────────────────────────────────────────────────────────────
+
     # Reject absolute paths and ~ expansion at the API boundary.
     # Only relative paths within ~/.hermes/scripts/ are allowed.
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
@@ -204,9 +233,104 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _resolve_deliver_to_chat_id(
+    deliver: Optional[str],
+    origin_chat_id: str,
+) -> Optional[str]:
+    """Resolve a ``deliver`` field to a concrete target chat_id.
+
+    Bug A helper (2026-05-21). Returns the chat_id that a job with this
+    ``deliver`` setting would deliver into, given an ``origin_chat_id``
+    (used for ``"origin"`` / unset cases).
+
+    Returns
+    -------
+    str | None
+        - ``origin_chat_id`` for ``None``, ``""``, or ``"origin"`` (any case).
+        - ``None`` for ``"local"`` (never delivers to a chat).
+        - The parsed chat_id for ``"myah:<chat_id>[:<thread_id>]"``.
+        - ``None`` for unrecognized platforms or unparseable values.
+    """
+    if not deliver:
+        return origin_chat_id or None
+    raw = deliver.strip()
+    lowered = raw.lower()
+    if lowered == "origin":
+        return origin_chat_id or None
+    if lowered == "local":
+        return None
+    if raw.startswith("myah:"):
+        rest = raw[len("myah:"):]
+        chat_id = rest.split(":", 1)[0]
+        return chat_id or None
+    return None  # unknown platform or unparseable
+
+
+def _safe_deliver_display(deliver: Optional[str], current_chat_id: str) -> str:
+    """Format the ``deliver`` field for safe LLM consumption.
+
+    Bug A redaction (2026-05-21). The 2026-04-27 wrong-chat delivery
+    incident traced to: the LLM ran ``cronjob list`` in a chat where
+    ``origin.chat_id`` was different from a previously-created cron's
+    ``deliver`` UUID; the LLM copied that UUID verbatim into a NEW
+    cron's deliver field, causing the new cron to deliver to the wrong
+    chat.
+
+    Mitigation: ``cronjob list`` output never exposes another chat's
+    raw UUID. The LLM sees ``"this chat"`` for matching delivery,
+    ``"<other chat>"`` for non-matching, and the literal value for
+    ``"local"`` / unknown platforms.
+    """
+    if not deliver:
+        return "this chat"
+    raw = deliver.strip()
+    lowered = raw.lower()
+    if lowered == "origin":
+        return "this chat"
+    if lowered == "local":
+        return "local (no delivery)"
+    if raw.startswith("myah:"):
+        target = _resolve_deliver_to_chat_id(raw, current_chat_id)
+        if target == current_chat_id:
+            return "this chat"
+        return "<other chat>"
+    return raw  # unknown platform — show literal (no UUID to leak)
+
+
+def _find_conflicting_job_in_chat(
+    target_chat_id: str,
+    existing_jobs: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the first existing job whose deliver target equals
+    ``target_chat_id``, or ``None`` if no conflict.
+
+    Bug A one-cron-per-chat constraint (2026-05-21). Each chat supports
+    at most one scheduled task to keep the in-chat experience focused.
+    Trying to add a second cron whose resolved deliver target lands in
+    a chat that already has a cron returns an actionable error so the
+    LLM (and user) can decide between updating the existing cron or
+    creating a fresh chat.
+    """
+    if not target_chat_id:
+        return None
+    for job in existing_jobs:
+        deliver = job.get("deliver")
+        origin_chat_id = (job.get("origin") or {}).get("chat_id", "") or ""
+        job_target = _resolve_deliver_to_chat_id(deliver, origin_chat_id)
+        if job_target == target_chat_id:
+            return job
+    return None
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = job.get("prompt", "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
+    # Bug A redaction: hide other chats' UUIDs in the LLM-facing listing.
+    _current_chat_id = ""
+    try:
+        _current_chat_id = (_origin_from_env() or {}).get("chat_id", "") or ""
+    except Exception:  # noqa: BLE001 — never raise during formatting
+        _current_chat_id = ""
     result = {
         "job_id": job["id"],
         "name": job["name"],
@@ -218,7 +342,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display"),
         "repeat": _repeat_display(job),
-        "deliver": job.get("deliver", "local"),
+        "deliver": _safe_deliver_display(job.get("deliver", "local"), _current_chat_id),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -292,6 +416,34 @@ def cronjob(
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+
+            # ── Bug A: one-cron-per-chat constraint (2026-05-21) ───────────────
+            # Refuse to create a second cron in a chat that already has one.
+            # Each chat supports at most one scheduled task so the user
+            # always knows which cron is delivering to which conversation.
+            # Resolve the would-be deliver target using the current
+            # origin's chat_id; skip the check for 'local' (no chat) and
+            # unrecognized platforms.
+            _origin = _origin_from_env() or {}
+            _origin_chat_id = _origin.get("chat_id", "") or ""
+            _target_chat_id = _resolve_deliver_to_chat_id(deliver, _origin_chat_id)
+            if _target_chat_id:
+                _conflict = _find_conflicting_job_in_chat(
+                    _target_chat_id, list_jobs(include_disabled=False)
+                )
+                if _conflict is not None:
+                    _existing_name = _conflict.get("name") or _conflict.get("id") or "an existing task"
+                    return tool_error(
+                        f"This chat already has a scheduled task "
+                        f"({_existing_name!r}). Each chat supports one task. "
+                        f"To proceed, either ask the user to (a) start a new "
+                        f"chat for this new task, or (b) update the existing "
+                        f"task via cronjob(action='update', job_id="
+                        f"{_conflict.get('id')!r}, ...) — do not silently "
+                        f"replace it.",
+                        success=False,
+                    )
+            # ────────────────────────────────────────────────────────────────────
 
             # ── Myah: user confirmation ────────────────────────────────────────
             # Block the agent thread until the user approves or denies.
