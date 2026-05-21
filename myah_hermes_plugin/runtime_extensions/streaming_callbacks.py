@@ -73,6 +73,78 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _read_chat_id_from_session_context() -> str:
+    """Read the platform chat_id from the upstream session contextvar.
+
+    Same source ``myah_tools.cron_tool._origin_from_env`` reads from
+    for ``origin.chat_id`` — established, in-tree pattern.
+
+    Returns the chat_id string, or empty string on any failure (import
+    error, contextvar unset, etc.). Never raises — the caller treats
+    empty as "no chat_id resolvable" and falls back to the legacy
+    ``session_id`` arg.
+    """
+    try:
+        from gateway.session_context import get_session_env  # type: ignore
+
+        return get_session_env("HERMES_SESSION_CHAT_ID") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _resolve_session_key_for_hook(
+    adapter: Any,
+    session_id_arg: str,
+) -> str:
+    """Resolve the agent session_key from the hook's session_id arg.
+
+    Why this exists
+    ---------------
+
+    Upstream Hermes' ``invoke_hook("pre_llm_call", session_id=...)``
+    contract changed at some point between plugin SHA bumps: the
+    ``session_id`` arg is now the *gateway's internal session marker*
+    (timestamp + random hex like ``20260521_044539_f022aaeb``) — NOT
+    the platform-supplied chat_id (UUID like
+    ``ca5ecc16-8f95-4076-8267-3218363dcc27``).
+
+    The adapter's ``_chat_id_session_keys[chat_id] = session_key``
+    map is keyed by chat_id. Looking up by the new internal-session
+    marker always missed; every hook bailed silently; the Phase F
+    structured-streaming workaround never fired in production
+    (verified 2026-05-21 via diagnostic-logging plugin SHA 9e150dc).
+
+    Resolution
+    ----------
+
+    1. Fast path: try ``session_id_arg`` directly. This is the legacy
+       contract (older upstream) and the path tests exercise.
+    2. Fallback: read the chat_id from the
+       ``HERMES_SESSION_CHAT_ID`` env-var-style contextvar set by
+       upstream ``gateway/run.py:_set_session_env`` from
+       ``context.source.chat_id``, then look that up in
+       ``_chat_id_session_keys``.
+
+    Either path matches → return the session_key. Both fail →
+    return empty string and let the caller bail with a log line.
+    """
+    chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
+
+    # Fast path: arg is the chat_id (older upstream, tests).
+    session_key = chat_session_keys.get(session_id_arg)
+    if session_key:
+        return session_key
+
+    # Fallback: read chat_id from the session contextvar (modern upstream).
+    chat_id_from_ctx = _read_chat_id_from_session_context()
+    if chat_id_from_ctx:
+        session_key = chat_session_keys.get(chat_id_from_ctx)
+        if session_key:
+            return session_key
+
+    return ""
+
+
 def _get_latest_adapter():
     """Indirection so tests can monkeypatch this."""
     try:
@@ -107,26 +179,14 @@ def myah_pre_llm_call(
     Hooks may return a ``{"context": str}`` dict to inject extra context
     into the user message, but we don't use that — we return ``None``.
     """
-    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
-    # Tier 1: surface every bailout in this hook at INFO so production
-    # logs reveal which check is failing. Promote-then-revert pattern:
-    # once root cause is identified, revert this commit and ship the
-    # targeted fix.
-    # ─────────────────────────────────────────────────────────────────────
-    logger.info(
-        "[streaming-diag] pre_llm_call entry: platform=%r session_id=%r kwargs_keys=%r",
-        platform,
-        session_id,
-        sorted(kwargs.keys()) if kwargs else [],
-    )
-
     if platform != "myah":
-        logger.info("[streaming-diag] BAIL@platform-mismatch: platform=%r", platform)
         return None
 
     adapter = _get_latest_adapter()
     if adapter is None:
-        logger.info("[streaming-diag] BAIL@adapter-none: _LATEST_ADAPTER is None")
+        logger.debug(
+            "[myah-streaming] pre_llm_call fired but no MyahAdapter active"
+        )
         return None
 
     # Use the adapter's lazy runner self-discovery instead of reading
@@ -138,52 +198,32 @@ def myah_pre_llm_call(
     if callable(_resolve):
         try:
             runner = _resolve()
-        except Exception as _exc:
-            logger.info("[streaming-diag] _resolve_runner raised: %s", _exc)
+        except Exception:
             runner = None
     else:
         # Older MyahAdapter without _resolve_runner — fall back to attr read
         # so a partially upgraded plugin still degrades gracefully.
         runner = getattr(adapter, "gateway_runner", None)
-        logger.info("[streaming-diag] adapter has no _resolve_runner; fallback runner=%r", runner)
     if runner is None:
-        logger.info("[streaming-diag] BAIL@runner-none: no GatewayRunner available")
+        logger.debug("[myah-streaming] no GatewayRunner available")
         return None
 
-    chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
-    session_key = chat_session_keys.get(session_id)
+    # Resolve the agent session_key. See _resolve_session_key_for_hook
+    # docstring for the upstream contract drift this works around.
+    session_key = _resolve_session_key_for_hook(adapter, session_id)
     if not session_key:
         # Likely a session that wasn't initiated through
-        # _handle_message_endpoint (e.g. internal subagent run). Skip.
-        logger.info(
-            "[streaming-diag] BAIL@session-key-miss: session_id=%r not in "
-            "_chat_id_session_keys (size=%d, sample_keys=%r)",
-            session_id,
-            len(chat_session_keys),
-            list(chat_session_keys.keys())[:3],
-        )
+        # _handle_message_endpoint (e.g. internal subagent run), or the
+        # contextvar isn't propagated to this thread. Skip.
         return None
-    logger.info(
-        "[streaming-diag] session-key-hit: session_id=%r → session_key=%r",
-        session_id,
-        session_key,
-    )
 
     cache = getattr(runner, "_agent_cache", {}) or {}
     cached = cache.get(session_key)
     if not cached:
         logger.info(
-            "[streaming-diag] BAIL@cache-miss: session_key=%r not in "
-            "runner._agent_cache (size=%d, sample_keys=%r)",
-            session_key,
-            len(cache),
-            list(cache.keys())[:3],
+            "[myah-streaming] no cached agent for session_key=%s", session_key,
         )
         return None
-    logger.info(
-        "[streaming-diag] cache-hit: cached_type=%s",
-        type(cached).__name__,
-    )
     # The cache stores (agent, sig) tuples in vanilla. Be defensive:
     # if shape ever changes to a bare agent, handle that too.
     agent = cached[0] if isinstance(cached, tuple) else cached
@@ -192,20 +232,12 @@ def myah_pre_llm_call(
         cbs = adapter.get_structured_callbacks(session_key)
     except Exception:
         logger.exception(
-            "[streaming-diag] BAIL@get_structured_callbacks-raised for %s",
+            "[myah-streaming] adapter.get_structured_callbacks raised for %s",
             session_key,
         )
         return None
     if not cbs:
-        logger.info(
-            "[streaming-diag] BAIL@cbs-empty: get_structured_callbacks returned %r",
-            cbs,
-        )
         return None
-    logger.info(
-        "[streaming-diag] cbs-ready: keys=%r",
-        sorted(cbs.keys()),
-    )
 
     # Mutate the agent's callback attributes. AIAgent reads these at
     # call time (not at construction time), so the imminent LLM call
@@ -234,10 +266,6 @@ def myah_pre_llm_call(
 
     logger.info(
         "[myah-streaming] structured callbacks installed for session=%s",
-        session_key,
-    )
-    logger.info(
-        "[streaming-diag] SUCCESS: callbacks installed; native_streaming_used += %r",
         session_key,
     )
     return None
@@ -303,35 +331,19 @@ def myah_post_llm_call(
 
     Returns None so this hook never affects ``final_response``.
     """
-    # ── DIAGNOSTIC INSTRUMENTATION (2026-05-21) ─────────────────────────
-    logger.info(
-        "[streaming-diag] post_llm_call entry: platform=%r session_id=%r "
-        "assistant_response_len=%d",
-        platform,
-        session_id,
-        len(assistant_response or ""),
-    )
-
     if platform != "myah":
         return None
     if not assistant_response:
-        logger.info("[streaming-diag] post_llm_call: empty assistant_response — no-op")
         return None
 
     adapter = _get_latest_adapter()
     if adapter is None:
-        logger.info("[streaming-diag] post_llm_call BAIL@adapter-none")
         return None
 
-    chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
-    session_key = chat_session_keys.get(session_id)
+    # Resolve the agent session_key. See _resolve_session_key_for_hook
+    # docstring for the upstream contract drift this works around.
+    session_key = _resolve_session_key_for_hook(adapter, session_id)
     if not session_key:
-        logger.info(
-            "[streaming-diag] post_llm_call BAIL@session-key-miss: session_id=%r "
-            "(map_size=%d)",
-            session_id,
-            len(chat_session_keys),
-        )
         return None
 
     stream_invoked = getattr(adapter, "_stream_delta_invoked", None)
@@ -339,22 +351,12 @@ def myah_post_llm_call(
         # _stream_delta_invoked not initialized — likely a partially
         # upgraded plugin. Skip the surface-response logic; existing
         # streaming behavior unchanged.
-        logger.info("[streaming-diag] post_llm_call BAIL@stream_invoked-None")
         return None
 
     if session_key in stream_invoked:
         # Streaming actually fired — the user has already seen the
         # response token-by-token. Nothing to do.
-        logger.info(
-            "[streaming-diag] post_llm_call: streaming-happy-path session=%r",
-            session_key,
-        )
         return None
-    logger.info(
-        "[streaming-diag] post_llm_call: streaming-DID-NOT-fire session=%r, "
-        "will surface response",
-        session_key,
-    )
 
     # No streaming happened. The gateway is about to suppress the
     # final send. Surface the response ourselves so the user sees
