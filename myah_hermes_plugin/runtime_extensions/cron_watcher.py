@@ -48,8 +48,10 @@ polymorphism) would close that gap. Not blocking OSS launch.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -64,13 +66,43 @@ from cron.jobs import OUTPUT_DIR, load_jobs
 logger = logging.getLogger(__name__)
 
 # Module-level state for idempotency: seen file mtimes, so the same
-# output isn't delivered twice on consecutive ticks.
+# output isn't delivered twice on consecutive ticks. Synced to disk
+# at ``_STATE_FILE`` after every successful delivery (see
+# ``_save_seen_state``), so a container restart can resume from the
+# exact same delivered set instead of re-applying an age-based cutoff.
 _seen_mtimes: dict[Path, float] = {}
 
-# Don't replay historical files on plugin startup. Files older than
-# this many seconds are seeded into _seen_mtimes without triggering
-# delivery on the first tick.
-_BOOTSTRAP_AGE_SECS = 60
+# Persistent seen-state file. Lives in the same dir as ``jobs.json``
+# so it survives container restarts (the whole /data/.hermes/ tree is
+# volume-mounted). Format documented in ``_save_seen_state``.
+#
+# Why persistent (2026-05-22): an earlier in-memory-only implementation
+# applied a 60-second bootstrap-age cutoff on first tick after start.
+# That cutoff caused real data loss when container respawns happened
+# more than 60s after cron output was written — the plugin's lazy
+# ``pre_gateway_dispatch`` start adds inherent delay, and Hetzner
+# deploys took the watcher offline at exactly the wrong moments.
+# Persistent state replaces the cutoff with a "what we've actually
+# delivered" record, guaranteeing zero loss across restarts.
+#
+# Resolved dynamically from ``OUTPUT_DIR`` at every reference so tests
+# can monkeypatch ``OUTPUT_DIR`` to a tmp dir and the state file
+# follows. The PEP 562 ``__getattr__`` re-export below lets external
+# callers (and tests) reference ``cron_watcher._STATE_FILE`` as if it
+# were a module attribute.
+def _state_file_path() -> Path:
+    return OUTPUT_DIR.parent / ".watcher-seen.json"
+
+
+def __getattr__(name: str):
+    if name == "_STATE_FILE":
+        return _state_file_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+# Internal flag — flipped to True after the first ``_tick`` call
+# loads (or seeds) the on-disk state, so subsequent ticks don't
+# re-load.
+_state_loaded: bool = False
 
 _TICK_INTERVAL_SECS = 2.0
 _HTTP_TIMEOUT_SECS = 15
@@ -261,37 +293,158 @@ async def _watch_loop() -> None:
         await asyncio.sleep(_TICK_INTERVAL_SECS)
 
 
+def _load_seen_state() -> Optional[dict[Path, float]]:
+    """Read the persistent seen-state file.
+
+    Returns:
+        * ``{}`` — file exists and is a valid empty seen-set (post-
+          first-run with nothing delivered yet).
+        * ``{Path: mtime, ...}`` — file exists with prior deliveries.
+        * ``None`` — file is absent OR unreadable OR corrupted. The
+          caller treats this as the "first-run / recovery" case and
+          seeds without delivery.
+
+    The ``None`` vs ``{}`` distinction matters: an empty-but-valid
+    state means "we know nothing has been delivered yet" → any new
+    file IS new and should be delivered. A missing/corrupted state
+    means "we lost our memory" → don't replay history.
+    """
+    state_file = _state_file_path()
+    try:
+        raw = state_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("cron watcher: failed to read state file %s: %s", state_file, exc)
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "cron watcher: state file %s is corrupted (%s); treating as fresh start",
+            state_file, exc,
+        )
+        return None
+    seen = data.get("seen") if isinstance(data, dict) else None
+    if not isinstance(seen, dict):
+        logger.warning("cron watcher: state file %s missing 'seen' map; treating as fresh start", state_file)
+        return None
+    return {Path(path): float(mtime) for path, mtime in seen.items()}
+
+
+def _save_seen_state(state: dict[Path, float]) -> None:
+    """Atomic write of the seen-state to disk.
+
+    Writes ``{"version": 1, "seen": {<str path>: <mtime>}}`` to a
+    temporary file in the same directory, then ``os.replace``s it
+    onto the canonical path. ``os.replace`` is atomic on POSIX, so
+    a process crash mid-write leaves the prior state intact (no
+    half-written JSON ever appears at the canonical path).
+    """
+    state_file = _state_file_path()
+    parent = state_file.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cron watcher: cannot create state dir %s: %s", parent, exc)
+        return
+    payload = {
+        "version": 1,
+        "seen": {str(path): mtime for path, mtime in state.items()},
+    }
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(parent),
+            prefix=".watcher-seen.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            json.dump(payload, tmp)
+            tmp_path = tmp.name
+        os.replace(tmp_path, str(state_file))
+    except OSError as exc:
+        logger.warning("cron watcher: failed to save state file: %s", exc)
+
+
+def _enumerate_output_files() -> list[tuple[str, Path, float]]:
+    """List every current ``(job_id, output_file, mtime)`` tuple.
+
+    Centralized so ``_tick`` and the first-run seed share the same
+    discovery logic.
+    """
+    found: list[tuple[str, Path, float]] = []
+    for job_dir in OUTPUT_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        for output_file in job_dir.glob("*.md"):
+            try:
+                mtime = output_file.stat().st_mtime
+            except OSError:
+                continue
+            found.append((job_dir.name, output_file, mtime))
+    return found
+
+
+def _ensure_state_loaded() -> None:
+    """Called once on the first ``_tick``. Either loads existing
+    state from disk OR seeds every currently-present output file
+    into ``_seen_mtimes`` without delivery (first-run protection
+    against historical replay).
+
+    Idempotent — subsequent calls are no-ops because ``_state_loaded``
+    flips to True after the first successful call.
+    """
+    global _state_loaded, _seen_mtimes
+    if _state_loaded:
+        return
+    loaded = _load_seen_state()
+    if loaded is not None:
+        # Trust the on-disk record — even an empty dict means "we
+        # know nothing has been delivered yet, so anything new IS new".
+        _seen_mtimes.update(loaded)
+        _state_loaded = True
+        return
+    # First run (or recovered-from-corrupt). Seed everything we see
+    # NOW as "already delivered" — we don't know what the prior plugin
+    # process (if any) actually delivered, so the safe behavior is
+    # "don't replay history". Subsequent ticks deliver only files
+    # that appear AFTER this seeding pass.
+    if OUTPUT_DIR.exists():
+        for _job_id, output_file, mtime in _enumerate_output_files():
+            _seen_mtimes[output_file] = mtime
+    _save_seen_state(_seen_mtimes)
+    _state_loaded = True
+
+
 async def _tick(base_url: str, bearer: str) -> None:
     if not OUTPUT_DIR.exists():
         return
+
+    # First call seeds or loads state. After this, ``_seen_mtimes``
+    # reflects the persistent source of truth for delivered files.
+    _ensure_state_loaded()
+
     try:
         all_jobs = load_jobs() or []
     except Exception:
         logger.exception("cron watcher: failed to read jobs.json")
         all_jobs = []
     jobs_by_id = {j.get("id"): j for j in all_jobs if isinstance(j, dict)}
-    cutoff = time.time() - _BOOTSTRAP_AGE_SECS
 
-    for job_dir in OUTPUT_DIR.iterdir():
-        if not job_dir.is_dir():
+    state_dirty = False
+    for job_id, output_file, mtime in _enumerate_output_files():
+        if _seen_mtimes.get(output_file) == mtime:
             continue
-        job_id = job_dir.name
-        for output_file in job_dir.glob("*.md"):
-            try:
-                mtime = output_file.stat().st_mtime
-            except OSError:
-                continue
-            if _seen_mtimes.get(output_file) == mtime:
-                continue
-            # Bootstrap behavior: don't replay files that predate
-            # plugin startup.
-            if output_file not in _seen_mtimes and mtime < cutoff:
-                _seen_mtimes[output_file] = mtime
-                continue
-            _seen_mtimes[output_file] = mtime
-            await _deliver(
-                base_url, bearer, jobs_by_id.get(job_id, {}), job_id, output_file
-            )
+        # Not in seen state (or mtime changed) → deliver and record.
+        _seen_mtimes[output_file] = mtime
+        state_dirty = True
+        await _deliver(
+            base_url, bearer, jobs_by_id.get(job_id, {}), job_id, output_file
+        )
+    if state_dirty:
+        _save_seen_state(_seen_mtimes)
 
 
 async def _deliver(

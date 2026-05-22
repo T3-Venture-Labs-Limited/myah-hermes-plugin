@@ -23,14 +23,31 @@ import pytest
 
 @pytest.fixture
 def fake_output_dir(tmp_path, monkeypatch):
-    """Set up a fake ~/.hermes/cron/output/ directory."""
-    output_dir = tmp_path / "output"
+    """Set up a fake ~/.hermes/cron/output/ directory.
+
+    Also resets cron_watcher module state and pre-creates an EMPTY
+    persistent seen-state file. Empty state signals "post-first-run,
+    we've delivered nothing so far → anything new IS new", which is
+    the contract these tests exercise. (A missing state file would
+    trigger the first-run seed-without-delivery path covered by the
+    test_cron_watcher_persistent_state.py suite.)
+    """
+    import json
+    output_dir = tmp_path / "cron" / "output"
     output_dir.mkdir(parents=True)
     monkeypatch.setattr(
         "myah_hermes_plugin.runtime_extensions.cron_watcher.OUTPUT_DIR",
         output_dir,
         raising=False,
     )
+    # Reset module state every test so order-of-execution doesn't
+    # bleed across cases.
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    cron_watcher._state_loaded = False
+    # Pre-create empty state — simulates post-first-run.
+    state_file = output_dir.parent / ".watcher-seen.json"
+    state_file.write_text(json.dumps({"version": 1, "seen": {}}))
     return output_dir
 
 
