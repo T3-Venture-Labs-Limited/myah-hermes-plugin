@@ -405,3 +405,207 @@ class TestHelperFunctions:
         state_file = watcher_dirs.parent / ".watcher-seen.json"
         data = json.loads(state_file.read_text())
         assert data == {"version": 1, "seen": {"/foo/bar.md": 999.5}}
+
+
+# ─── Robustness against partially-malformed state ────────────────────
+
+
+class TestMalformedStateValuesRecover:
+    """Regression coverage for the code-review HIGH-1 finding: a non-
+    numeric value in the ``seen`` dict (string, None, list, dict)
+    used to crash ``_load_seen_state`` with ValueError/TypeError that
+    propagated up through ``_tick`` into the outer exception handler,
+    leaving the watcher in a permanent failure loop with no log
+    indication that the state file was at fault. Fix: catch coercion
+    errors per-entry and return None (treat-as-corrupted) — same
+    contract as invalid JSON."""
+
+    def test_non_float_mtime_treated_as_corrupted(self, watcher_dirs, caplog):
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({
+            "version": 1,
+            "seen": {"/data/.hermes/cron/output/job/file.md": "not_a_number"},
+        }))
+        from myah_hermes_plugin.runtime_extensions import cron_watcher
+        result = cron_watcher._load_seen_state()
+        assert result is None, (
+            "non-coercible mtime must be treated as corrupted state, "
+            "not propagate ValueError to the caller"
+        )
+
+    def test_null_mtime_treated_as_corrupted(self, watcher_dirs):
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({
+            "version": 1,
+            "seen": {"/foo.md": None},
+        }))
+        from myah_hermes_plugin.runtime_extensions import cron_watcher
+        result = cron_watcher._load_seen_state()
+        assert result is None
+
+    def test_list_mtime_treated_as_corrupted(self, watcher_dirs):
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({
+            "version": 1,
+            "seen": {"/foo.md": [1, 2]},
+        }))
+        from myah_hermes_plugin.runtime_extensions import cron_watcher
+        result = cron_watcher._load_seen_state()
+        assert result is None
+
+    def test_tick_does_not_crash_on_malformed_state(
+        self, watcher_dirs, monkeypatch, fake_job, fake_aiohttp
+    ):
+        """End-to-end: malformed state file → tick must NOT raise; it
+        must fall back to first-run behavior and seed cleanly."""
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", "http://platform.test")
+        monkeypatch.setenv("MYAH_AGENT_BEARER_TOKEN", "test-token")
+        monkeypatch.setenv("MYAH_USER_ID", "user-123")
+
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({
+            "version": 1,
+            "seen": {"/orphan.md": "this is not a float"},
+        }))
+
+        job_dir = watcher_dirs / "joba"
+        job_dir.mkdir()
+        f = job_dir / "out.md"
+        f.write_text("Output")
+
+        import asyncio
+        from myah_hermes_plugin.runtime_extensions import cron_watcher
+        # Must not raise — even though the state file has a bad value.
+        asyncio.run(cron_watcher._tick("http://platform.test", "test-token"))
+
+        # And the state file should be rewritten cleanly.
+        rewritten = json.loads(state_file.read_text())
+        assert rewritten.get("version") == 1
+        # First-run seed: the current file is now in seen, undelivered.
+        assert len(fake_aiohttp) == 0
+
+
+# ─── Delivery success required before persist ────────────────────────
+
+
+class TestFailedDeliveryNotPersistedAsDelivered:
+    """Regression coverage for the code-review HIGH-2 finding.
+
+    Pre-fix in-memory state had the same bookkeeping order (mark
+    before deliver), but the in-memory wipe on restart accidentally
+    provided retry behavior: a transient platform failure during
+    deploy → file in-memory-seen → restart → memory wiped → file
+    rediscovered as new → re-delivered.
+
+    The persistent-state change escalates this into permanent data
+    loss: same failure → file disk-seen → restart loads it as
+    delivered → file skipped forever.
+
+    Fix: only update ``_seen_mtimes`` and persist after ``_deliver``
+    confirms success. ``_deliver`` returns a bool now."""
+
+    def test_failed_delivery_does_not_persist_as_delivered(
+        self, watcher_dirs, monkeypatch, fake_job
+    ):
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", "http://platform.test")
+        monkeypatch.setenv("MYAH_AGENT_BEARER_TOKEN", "test-token")
+        monkeypatch.setenv("MYAH_USER_ID", "user-123")
+
+        # Pre-existing empty state → "post-first-run, anything new delivers".
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({"version": 1, "seen": {}}))
+
+        job_dir = watcher_dirs / "joba"
+        job_dir.mkdir()
+        f = job_dir / "out.md"
+        f.write_text("Output")
+
+        # ClientSession that returns HTTP 502 — simulates platform
+        # transient failure during a deploy.
+        class FakeResp:
+            status = 502
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class FakeSession:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            def post(self, *a, **kw):
+                return FakeResp()
+
+        from unittest.mock import patch
+        with patch("aiohttp.ClientSession", FakeSession):
+            import asyncio
+            from myah_hermes_plugin.runtime_extensions import cron_watcher
+            asyncio.run(cron_watcher._tick("http://platform.test", "test-token"))
+
+        # CRITICAL: the file must NOT be recorded as delivered, because
+        # the HTTP POST returned 502. On the next tick (or after a
+        # restart that reloads state), this file MUST be re-attempted.
+        saved = json.loads(state_file.read_text())
+        assert str(f) not in saved["seen"], (
+            "file was marked seen on disk despite HTTP 502 — converts "
+            "transient delivery failures into permanent data loss"
+        )
+
+    def test_delivery_exception_does_not_persist_as_delivered(
+        self, watcher_dirs, monkeypatch, fake_job
+    ):
+        """Network exception path (timeout, connection refused) — same
+        contract: don't mark as delivered if the POST never landed."""
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", "http://platform.test")
+        monkeypatch.setenv("MYAH_AGENT_BEARER_TOKEN", "test-token")
+        monkeypatch.setenv("MYAH_USER_ID", "user-123")
+
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({"version": 1, "seen": {}}))
+
+        job_dir = watcher_dirs / "joba"
+        job_dir.mkdir()
+        f = job_dir / "out.md"
+        f.write_text("Output")
+
+        class FakeSession:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            def post(self, *a, **kw):
+                raise ConnectionError("simulated network failure")
+
+        from unittest.mock import patch
+        with patch("aiohttp.ClientSession", FakeSession):
+            import asyncio
+            from myah_hermes_plugin.runtime_extensions import cron_watcher
+            # Must not raise; failure is logged + counted.
+            asyncio.run(cron_watcher._tick("http://platform.test", "test-token"))
+
+        saved = json.loads(state_file.read_text())
+        assert str(f) not in saved["seen"], (
+            "file was marked seen on disk despite the POST raising"
+        )
+
+    def test_successful_delivery_does_persist(
+        self, watcher_dirs, monkeypatch, fake_job, fake_aiohttp
+    ):
+        """Sanity check on the happy path — successful delivery DOES
+        record the file in the state."""
+        monkeypatch.setenv("MYAH_PLATFORM_BASE_URL", "http://platform.test")
+        monkeypatch.setenv("MYAH_AGENT_BEARER_TOKEN", "test-token")
+        monkeypatch.setenv("MYAH_USER_ID", "user-123")
+
+        state_file = watcher_dirs.parent / ".watcher-seen.json"
+        state_file.write_text(json.dumps({"version": 1, "seen": {}}))
+
+        job_dir = watcher_dirs / "joba"
+        job_dir.mkdir()
+        f = job_dir / "out.md"
+        f.write_text("Output")
+
+        import asyncio
+        from myah_hermes_plugin.runtime_extensions import cron_watcher
+        asyncio.run(cron_watcher._tick("http://platform.test", "test-token"))
+
+        assert len(fake_aiohttp) == 1
+        saved = json.loads(state_file.read_text())
+        assert str(f) in saved["seen"]

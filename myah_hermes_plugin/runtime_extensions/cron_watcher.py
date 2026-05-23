@@ -329,7 +329,32 @@ def _load_seen_state() -> Optional[dict[Path, float]]:
     if not isinstance(seen, dict):
         logger.warning("cron watcher: state file %s missing 'seen' map; treating as fresh start", state_file)
         return None
-    return {Path(path): float(mtime) for path, mtime in seen.items()}
+    # Coerce per-entry rather than via a single dict comprehension so
+    # one malformed value (non-string key, non-numeric mtime, null,
+    # list, dict) doesn't crash the entire load and leave the watcher
+    # in a permanent failure loop. Drop bad entries with a WARNING;
+    # if the whole file is unusable (zero good entries) treat it as
+    # missing and let first-run recovery seed fresh.
+    out: dict[Path, float] = {}
+    for raw_path, raw_mtime in seen.items():
+        try:
+            out[Path(str(raw_path))] = float(raw_mtime)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "cron watcher: dropping malformed state entry %r=%r (%s)",
+                raw_path, raw_mtime, exc,
+            )
+    if not out and seen:
+        # File had entries but none survived coercion → equivalent to
+        # corrupted-state. Return None so the caller re-seeds from
+        # disk and overwrites this file cleanly.
+        logger.warning(
+            "cron watcher: every entry in %s was malformed; "
+            "treating as corrupted and re-seeding",
+            state_file,
+        )
+        return None
+    return out
 
 
 def _save_seen_state(state: dict[Path, float]) -> None:
@@ -352,6 +377,7 @@ def _save_seen_state(state: dict[Path, float]) -> None:
         "version": 1,
         "seen": {str(path): mtime for path, mtime in state.items()},
     }
+    tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -364,8 +390,19 @@ def _save_seen_state(state: dict[Path, float]) -> None:
             json.dump(payload, tmp)
             tmp_path = tmp.name
         os.replace(tmp_path, str(state_file))
+        tmp_path = None  # ownership transferred to state_file
     except OSError as exc:
         logger.warning("cron watcher: failed to save state file: %s", exc)
+    finally:
+        # Clean up the tmp file if replace() never ran (e.g. disk full
+        # mid-write, EACCES on rename). Otherwise the .tmp files
+        # accumulate in /data/.hermes/cron/ and compound on disk-full
+        # incidents.
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _enumerate_output_files() -> list[tuple[str, Path, float]]:
@@ -403,6 +440,10 @@ def _ensure_state_loaded() -> None:
     if loaded is not None:
         # Trust the on-disk record — even an empty dict means "we
         # know nothing has been delivered yet, so anything new IS new".
+        # Clear first so that test-harness leaks (or any other reason
+        # _seen_mtimes might hold stale entries pre-load) don't merge
+        # into the loaded state — replace, don't union.
+        _seen_mtimes.clear()
         _seen_mtimes.update(loaded)
         _state_loaded = True
         return
@@ -437,29 +478,53 @@ async def _tick(base_url: str, bearer: str) -> None:
     for job_id, output_file, mtime in _enumerate_output_files():
         if _seen_mtimes.get(output_file) == mtime:
             continue
-        # Not in seen state (or mtime changed) → deliver and record.
-        _seen_mtimes[output_file] = mtime
-        state_dirty = True
-        await _deliver(
+        # Mark-after-success: only record the file as delivered if
+        # ``_deliver`` confirms the webhook accepted it. If we recorded
+        # the file BEFORE the call, a transient platform failure (HTTP
+        # 502 during a deploy, connection refused mid-restart) would
+        # be persisted to disk as "delivered" — and the next tick
+        # (and every subsequent restart-then-load) would skip the
+        # file forever. That's the persistent-state version of the
+        # same data-loss class this PR is fixing.
+        delivered = await _deliver(
             base_url, bearer, jobs_by_id.get(job_id, {}), job_id, output_file
         )
+        if delivered:
+            _seen_mtimes[output_file] = mtime
+            state_dirty = True
     if state_dirty:
         _save_seen_state(_seen_mtimes)
 
 
 async def _deliver(
     base_url: str, bearer: str, job: dict, job_id: str, output_file: Path
-) -> None:
+) -> bool:
+    """Deliver one cron-output file to the platform webhook.
+
+    Returns:
+        * ``True`` — the webhook returned 2xx and accepted the output.
+          The caller MUST persist this file as seen.
+        * ``False`` — anything else (non-myah origin / skip, file
+          unreadable, missing chat_id, HTTP non-2xx, network exception).
+          The caller MUST NOT persist; the file will be retried on a
+          subsequent tick (or after a restart that reloads state).
+
+    The split-return is the safety contract for the persistent
+    seen-state: ``_tick`` only writes ``.watcher-seen.json`` for files
+    this function confirms delivered, so transient platform failures
+    don't get baked in as permanent "delivered" records.
+    """
     origin = job.get("origin") or {}
     if not isinstance(origin, dict) or origin.get("platform") != "myah":
-        # Non-myah cron jobs are delivered by their own adapters. Skip.
-        return
+        # Non-myah cron jobs are delivered by their own adapters. Skip
+        # cleanly (not a failure to re-attempt).
+        return False
 
     try:
         content = output_file.read_text(encoding="utf-8")
     except Exception:
         logger.exception("cron watcher: failed to read %s", output_file)
-        return
+        return False
 
     payload = {
         "user_id": os.environ.get("MYAH_USER_ID", ""),
@@ -477,7 +542,7 @@ async def _deliver(
         logger.warning(
             "cron watcher: job %s has myah origin but no chat_id; skipping", job_id
         )
-        return
+        return False
 
     url = f"{base_url}/api/v1/processes/webhook/run-complete"
     timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECS)
@@ -494,10 +559,12 @@ async def _deliver(
                         job_id, payload["chat_id"], resp.status,
                     )
                     _on_post_success()
-                else:
-                    _on_post_failure(job_id, f"HTTP {resp.status}")
+                    return True
+                _on_post_failure(job_id, f"HTTP {resp.status}")
+                return False
     except Exception as exc:
         _on_post_failure(job_id, str(exc) or type(exc).__name__)
+        return False
 
 
 _started = False
