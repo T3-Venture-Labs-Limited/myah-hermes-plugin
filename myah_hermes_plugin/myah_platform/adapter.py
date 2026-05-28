@@ -297,6 +297,9 @@ class MyahAdapter(BasePlatformAdapter):
 
         # stream_id → session_key (reverse lookup for confirm endpoint)
         self._stream_sessions: Dict[str, str] = {}
+        # raw chat_id -> latest platform assistant message_id. Used by the
+        # durable final-message fallback when the live SSE queue disappears.
+        self._chat_id_message_ids: Dict[str, str] = {}
 
         # Pending secret captures: stream_id → { event: threading.Event, result: dict }
         self._pending_secrets: Dict[str, Dict] = {}
@@ -546,6 +549,7 @@ class MyahAdapter(BasePlatformAdapter):
         user_name = body.get("user_name")
         user_id = body.get("user_id")
         chat_name = body.get("chat_name")
+        message_id = (body.get("message_id") or "").strip()
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
         # If the client supplies a 'model' field, apply it via
@@ -745,6 +749,8 @@ class MyahAdapter(BasePlatformAdapter):
         self._chat_id_streams[session_id] = stream_id
         self._session_streams[session_key] = stream_id
         self._stream_sessions[stream_id] = session_key
+        if message_id:
+            self._chat_id_message_ids[session_id] = message_id
 
         # ── Myah: media attachments ingestion ──────────────────────────────
         attachments = body.get('attachments') or []
@@ -2262,13 +2268,30 @@ class MyahAdapter(BasePlatformAdapter):
                 })
                 return SendResult(success=True, message_id=msg_id)
 
-        # No live stream and not a cron delivery — preserve the legacy
-        # ``No active stream`` failure shape.  The webhook is cron-only
-        # (rejects payloads without ``user_id``/``job_id``), so attempting
-        # it for a chat reply would always 400 and add log noise.
+        if stream_id:
+            logger.warning(
+                "[myah] send fallback: stream mapping exists but queue missing "
+                "chat_id=%s stream_id=%s active_streams=%s",
+                chat_id,
+                stream_id,
+                list(self._streams.keys()),
+            )
+        else:
+            logger.warning(
+                "[myah] send fallback: no chat_id->stream mapping "
+                "chat_id=%s active_chat_mappings=%s active_streams=%s",
+                chat_id,
+                dict(self._chat_id_streams),
+                list(self._streams.keys()),
+            )
+
+        durable_result = await self._send_chat_final_via_webhook(chat_id, content, meta)
+        if durable_result.success:
+            return durable_result
+
         return SendResult(
             success=False,
-            error=f"No active stream for chat_id={chat_id}",
+            error=durable_result.error or f"No active stream for chat_id={chat_id}",
         )
         # ────────────────────────────────────────────────────
 
@@ -2329,6 +2352,109 @@ class MyahAdapter(BasePlatformAdapter):
         })
         return merged
     # ────────────────────────────────────────────────────────
+
+    async def _send_chat_final_via_webhook(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Persist a completed interactive chat reply when SSE is unavailable."""
+        base_url = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')
+        bearer = _myah_os.environ.get('MYAH_PLATFORM_BEARER')
+        user_id = _myah_os.environ.get('MYAH_USER_ID', '')
+        if not (base_url and bearer and user_id and chat_id):
+            return SendResult(
+                success=False,
+                error=f"No active stream for chat_id={chat_id}",
+            )
+
+        meta = metadata or {}
+        message_id = (
+            meta.get('message_id')
+            or self._chat_id_message_ids.get(chat_id)
+            or ''
+        )
+        session_key = self._chat_id_session_keys.get(chat_id) or ''
+        model = ''
+        provider = ''
+        try:
+            runner = self._resolve_runner()
+            if runner is not None and session_key:
+                attribution = get_cached_agent_attribution_direct(runner, session_key)
+                if attribution is not None:
+                    model = attribution.get('model', '') or ''
+                    provider = attribution.get('provider', '') or ''
+                if not model:
+                    override = get_session_override_direct(runner, session_key) or {}
+                    model = override.get('model', '') or ''
+                    provider = override.get('provider', '') or ''
+        except Exception:
+            logger.debug("[myah] final-message attribution lookup failed", exc_info=True)
+
+        payload = {
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'response': content,
+            'status': meta.get('status') or 'ok',
+            'model': model,
+            'provider': provider,
+        }
+        url = f"{base_url.rstrip('/')}/api/v1/myah/messages/final"
+        headers = {'Authorization': f'Bearer {bearer}'}
+
+        try:
+            import aiohttp
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    body_text = ''
+                    try:
+                        body_text = (await resp.text())[:200]
+                    except Exception:
+                        pass
+                    if 200 <= resp.status < 300:
+                        msg_id = message_id or uuid.uuid4().hex[:12]
+                        logger.info(
+                            "[myah] durable final-message fallback delivered "
+                            "chat_id=%s message_id=%s",
+                            chat_id,
+                            msg_id,
+                        )
+                        return SendResult(success=True, message_id=msg_id)
+                    logger.warning(
+                        "Myah final-message fallback failed: status=%s url=%s "
+                        "chat_id=%s body=%r",
+                        resp.status,
+                        url,
+                        chat_id,
+                        body_text,
+                    )
+                    self._maybe_breadcrumb(
+                        f"final-message fallback non-2xx: {resp.status}",
+                        url=url, chat_id=chat_id, status=resp.status,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"final-message fallback returned HTTP {resp.status}",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Myah final-message fallback raised %s: %s (url=%s chat_id=%s)",
+                type(exc).__name__,
+                exc,
+                url,
+                chat_id,
+            )
+            self._maybe_breadcrumb(
+                f"final-message fallback exception: {type(exc).__name__}",
+                url=url, chat_id=chat_id, error=str(exc)[:200],
+            )
+            return SendResult(
+                success=False,
+                error=f"final-message fallback error: {type(exc).__name__}: {exc}",
+            )
 
     # ── Myah: Bug D v3 — webhook delivery helper ────────────
     async def _send_via_webhook(
