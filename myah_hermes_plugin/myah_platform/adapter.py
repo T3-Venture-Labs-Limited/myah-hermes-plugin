@@ -1050,6 +1050,7 @@ class MyahAdapter(BasePlatformAdapter):
 
                 # Phase F: clean up streaming workaround state
                 self._chat_id_session_keys.pop(chat_id, None)
+                self._chat_id_message_ids.pop(chat_id, None)
                 self._native_streaming_used.discard(session_key)
                 self._stream_delta_invoked.discard(session_key)
                 self._stream_had_content.discard(stream_id)
@@ -1754,6 +1755,7 @@ class MyahAdapter(BasePlatformAdapter):
                 ]
                 for cid in stale_chat_ids:
                     self._chat_id_streams.pop(cid, None)
+                    self._chat_id_message_ids.pop(cid, None)
                 # Close the queue if anyone is listening
                 if q is not None:
                     try:
