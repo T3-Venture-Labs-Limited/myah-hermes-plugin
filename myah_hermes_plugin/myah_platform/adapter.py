@@ -1490,15 +1490,23 @@ class MyahAdapter(BasePlatformAdapter):
         if not stream_id or stream_id not in self._streams:
             return SendResult(success=False, error='No active stream')
 
-        confirmation_id = uuid.uuid4().hex
         cmd_preview = command[:500] + '...' if len(command) > 500 else command
 
+        # ── Myah: exec_approval carries NO confirmation_id ──────────────────
+        # The pending exec approval lives in upstream
+        # ``tools.approval._gateway_queues`` keyed by ``session_key`` and is
+        # resolved by ``resolve_gateway_approval(session_key, choice)`` — it
+        # has no confirmation_id. Emitting a synthetic id here routed the
+        # frontend's Approve click into the action-queue branch of
+        # ``_handle_confirm_endpoint`` (which always 404s for exec_approval).
+        # Omitting the field lets the confirm endpoint take the legacy
+        # session/gateway path. ``send_action_confirmation`` keeps its real,
+        # registered confirmation_id.
         self._push_event_sync(stream_id, {
             'event': 'tool.confirmation_required',
             'stream_id': stream_id,
             'run_id': stream_id,
             'timestamp': time.time(),
-            'confirmation_id': confirmation_id,
             'action_type': 'exec_approval',
             'description': f'Command requires approval:\n{cmd_preview}\n\nReason: {description}',
             'options': ['approve', 'approve_session', 'deny'],
