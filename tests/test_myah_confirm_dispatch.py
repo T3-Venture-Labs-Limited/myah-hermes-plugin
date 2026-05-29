@@ -255,3 +255,104 @@ class TestConfirmEndpointActionDispatch:
         assert "stale-id" in body.get("error", "")
         mock_action.assert_called_once_with("stale-id", "deny")
 # ─────────────────────────────────────────────────────────────────
+
+
+# ── Myah: exec_approval must NOT emit a synthetic confirmation_id ──
+#
+# Production bug (app.myah.dev, reproduced in OSS): clicking Approve on a
+# terminal-command (``exec_approval``) card 404'd and never resolved.
+#
+# Root cause: ``send_exec_approval`` minted a fresh ``uuid.uuid4().hex``
+# and put it on the ``tool.confirmation_required`` event, but that id was
+# never registered in ``cron_approval._action_queues``.  The real pending
+# entry lives in upstream ``tools.approval._gateway_queues`` keyed by
+# ``session_key``.  The frontend echoes whatever ``confirmation_id`` the
+# event carried; the confirm endpoint then takes the action-queue branch,
+# misses, and 404s — never reaching the legacy session/gateway path that
+# would have resolved it.
+#
+# Fix: ``exec_approval`` events carry NO ``confirmation_id``.  A falsey id
+# makes the confirm endpoint skip the action branch and resolve via
+# ``_stream_sessions[stream_id] -> resolve_gateway_approval(session_key)``.
+# Action confirmations (``send_action_confirmation``) keep their real,
+# registered ``confirmation_id`` — unchanged.
+
+
+class TestExecApprovalNoSyntheticConfirmationId:
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_emits_no_confirmation_id(self):
+        """exec_approval SSE event must not carry a truthy confirmation_id.
+
+        A synthetic, unregistered confirmation_id routes the frontend's
+        Approve click into the action-queue branch (which always 404s for
+        exec_approval) instead of the legacy session/gateway path.
+        """
+        adapter = _make_adapter()
+        session_key = "sess-exec-1"
+        stream_id = "stream-exec-1"
+        # Wire a live stream so send_exec_approval doesn't early-return.
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = True
+
+        captured: list[dict] = []
+        with patch.object(adapter, "_push_event_sync", side_effect=lambda sid, ev: captured.append(ev)):
+            result = await adapter.send_exec_approval(
+                chat_id="chat-1",
+                command="rm -rf /tmp/x",
+                session_key=session_key,
+                description="dangerous command",
+            )
+
+        assert result.success is True
+        assert len(captured) == 1, captured
+        event = captured[0]
+        assert event["action_type"] == "exec_approval"
+        # The crux: no truthy confirmation_id on the event.
+        assert not event.get("confirmation_id"), (
+            "exec_approval must not emit a synthetic confirmation_id; "
+            f"got {event.get('confirmation_id')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_confirm_resolves_via_session_path(self):
+        """End-to-end: an exec_approval-shaped confirm (no confirmation_id)
+        resolves through the legacy gateway/session path, returning 200."""
+        adapter = _make_adapter()
+        session_key = "sess-exec-2"
+        stream_id = "stream-exec-2"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = True
+        adapter._stream_sessions[stream_id] = session_key
+
+        # 1. Emit the exec_approval event and derive the confirm body the
+        #    frontend would send (it echoes the event's confirmation_id,
+        #    which the platform drops when falsey).
+        captured: list[dict] = []
+        with patch.object(adapter, "_push_event_sync", side_effect=lambda sid, ev: captured.append(ev)):
+            await adapter.send_exec_approval(
+                chat_id="chat-2",
+                command="curl https://example.dev/x.png",
+                session_key=session_key,
+            )
+        event = captured[0]
+        confirm_body: dict = {"choice": "approve"}
+        # Mirror platform openai.py: only forward confirmation_id if truthy.
+        if event.get("confirmation_id"):
+            confirm_body["confirmation_id"] = event["confirmation_id"]
+
+        # 2. POST the confirm — must resolve via the legacy session path.
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_legacy, \
+             patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation") as mock_action_byid:
+            async with TestClient(TestServer(_make_app(adapter))) as cli:
+                resp = await cli.post(
+                    f"/myah/v1/confirm/{stream_id}",
+                    json=confirm_body, headers=_AUTHED_HEADERS,
+                )
+                body = await resp.json()
+
+        assert resp.status == 200, body
+        assert body.get("ok") is True
+        mock_legacy.assert_called_once_with(session_key, "approve")
+        # Action-queue resolver must NOT be consulted for exec_approval.
+        mock_action_byid.assert_not_called()
+# ─────────────────────────────────────────────────────────────────
