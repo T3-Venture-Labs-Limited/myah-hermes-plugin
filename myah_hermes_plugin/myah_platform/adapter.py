@@ -175,23 +175,55 @@ def _extract_visible_message_content(response: Any) -> str:
     """
     import re
 
+    def _strip_inline_reasoning(text: str) -> str:
+        return re.sub(
+            r'<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>'
+            r'.*?'
+            r'</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>',
+            '',
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    def _visible_text_from_part(part: Any) -> str:
+        if isinstance(part, str):
+            return part
+        if not isinstance(part, dict):
+            return ''
+
+        part_type = str(part.get('type') or '').lower()
+        if part_type not in {'text', 'output_text'}:
+            return ''
+
+        text = part.get('text')
+        if isinstance(text, str):
+            return text
+
+        # Some SDK content parts use nested shapes such as
+        # {'type': 'text', 'text': {'value': '...'}}.  Keep only explicit text
+        # fields and avoid stringifying arbitrary objects, which can leak
+        # reasoning/internal metadata as a Python repr.
+        if isinstance(text, dict):
+            value = text.get('value')
+            if isinstance(value, str):
+                return value
+
+        return ''
+
     try:
         msg = response.choices[0].message
     except Exception:
         return ''
 
     raw = getattr(msg, 'content', None) or ''
-    if not isinstance(raw, str):
-        raw = str(raw)
+    if isinstance(raw, str):
+        visible = raw
+    elif isinstance(raw, (list, tuple)):
+        visible = ''.join(_visible_text_from_part(part) for part in raw)
+    else:
+        visible = ''
 
-    return re.sub(
-        r'<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>'
-        r'.*?'
-        r'</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>',
-        '',
-        raw,
-        flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
+    return _strip_inline_reasoning(visible)
 
 
 # ── Myah: plugin version source ────────────────────────────────────────────

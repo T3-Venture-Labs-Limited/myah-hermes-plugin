@@ -287,6 +287,38 @@ async def test_aux_endpoint_think_only_content_does_not_fall_back_to_reasoning(f
 
 
 @pytest.mark.asyncio
+async def test_aux_endpoint_content_parts_keep_only_visible_text(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = [
+        {'type': 'reasoning', 'text': 'SECRET_CHAIN_OF_THOUGHT'},
+        {'type': 'text', 'text': '<think>scratchpad</think>Visible Title'},
+        {'type': 'output_text', 'text': {'value': ' from parts'}},
+        {'type': 'unknown', 'text': 'UNKNOWN_INTERNAL_METADATA'},
+        object(),
+    ]
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    content = body['choices'][0]['message']['content']
+    assert content == 'Visible Title from parts'
+    assert 'SECRET_CHAIN_OF_THOUGHT' not in content
+    assert 'UNKNOWN_INTERNAL_METADATA' not in content
+    assert "'type':" not in content
+
+
+@pytest.mark.asyncio
 async def test_aux_propagates_call_llm_error(fake_aux_module):
     adapter = _make_adapter()
     fake_aux_module.async_call_llm = AsyncMock(side_effect=RuntimeError('provider down'))
