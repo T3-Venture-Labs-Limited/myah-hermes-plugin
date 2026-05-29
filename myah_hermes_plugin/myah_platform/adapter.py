@@ -166,6 +166,66 @@ def check_myah_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+def _extract_visible_message_content(response: Any) -> str:
+    """Return only assistant-visible ``message.content`` from an LLM response.
+
+    Myah's title/follow-up aux endpoint produces strict, user-facing metadata.
+    Structured reasoning fields are internal scratch space and must never be
+    promoted into ``choices[0].message.content`` for these tasks.
+    """
+    import re
+
+    def _strip_inline_reasoning(text: str) -> str:
+        return re.sub(
+            r'<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>'
+            r'.*?'
+            r'</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>',
+            '',
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    def _visible_text_from_part(part: Any) -> str:
+        if isinstance(part, str):
+            return part
+        if not isinstance(part, dict):
+            return ''
+
+        part_type = str(part.get('type') or '').lower()
+        if part_type not in {'text', 'output_text'}:
+            return ''
+
+        text = part.get('text')
+        if isinstance(text, str):
+            return text
+
+        # Some SDK content parts use nested shapes such as
+        # {'type': 'text', 'text': {'value': '...'}}.  Keep only explicit text
+        # fields and avoid stringifying arbitrary objects, which can leak
+        # reasoning/internal metadata as a Python repr.
+        if isinstance(text, dict):
+            value = text.get('value')
+            if isinstance(value, str):
+                return value
+
+        return ''
+
+    try:
+        msg = response.choices[0].message
+    except Exception:
+        return ''
+
+    raw = getattr(msg, 'content', None) or ''
+    if isinstance(raw, str):
+        visible = raw
+    elif isinstance(raw, (list, tuple)):
+        visible = ''.join(_visible_text_from_part(part) for part in raw)
+    else:
+        visible = ''
+
+    return _strip_inline_reasoning(visible)
+
+
 # ── Myah: plugin version source ────────────────────────────────────────────
 # The platform's OSS first-run probe (D4 in vm-testing-followups.md) reads
 # this via ``GET /myah/health`` to surface plugin-version diagnostics.
@@ -1362,7 +1422,7 @@ class MyahAdapter(BasePlatformAdapter):
             extra_body['response_format'] = body['response_format']
 
         # ── Myah: aux router import for /myah/v1/aux/{task} ──────────────
-        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+        from agent.auxiliary_client import async_call_llm
         # ──────────────────────────────────────────────────────────────────
         try:
             response = await async_call_llm(
@@ -1383,13 +1443,11 @@ class MyahAdapter(BasePlatformAdapter):
                 'total_tokens': getattr(response.usage, 'total_tokens', 0),
             }
 
-        # Use extract_content_or_reasoning so reasoning-model responses
-        # (DeepSeek-R1, gemini-2.5-flash with thinking, etc.) that put
-        # output in `message.reasoning` instead of `message.content` still
-        # surface a non-null content string. See e2e-output/report.md
-        # ISSUE-002 — chat titles + follow-up chips fell back to empty
-        # because the raw .content was None for these models.
-        content = extract_content_or_reasoning(response)
+        # Myah title/follow-up aux tasks are strict user-facing metadata tasks.
+        # Only visible assistant content is authoritative; structured reasoning
+        # fields (`reasoning`, `reasoning_content`, `reasoning_details`) are
+        # internal scratch space and must never be promoted into `content`.
+        content = _extract_visible_message_content(response)
 
         return web.json_response({
             'choices': [{

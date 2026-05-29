@@ -1,4 +1,5 @@
 """Tests for POST /myah/v1/aux/{task} — HTTP wrapper for auxiliary_client.call_llm."""
+import json
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -38,12 +39,6 @@ def fake_aux_module():
     fake_llm = AsyncMock()
     fake_mod = types.ModuleType('agent.auxiliary_client')
     fake_mod.async_call_llm = fake_llm
-    # The aux endpoint now falls back through extract_content_or_reasoning
-    # so it can surface reasoning-model responses whose .content is None.
-    # In tests, pass .content through untouched.
-    fake_mod.extract_content_or_reasoning = lambda response: (
-        response.choices[0].message.content
-    )
 
     # Track whether we created the 'agent' parent package entry
     agent_existed = 'agent' in sys.modules
@@ -118,6 +113,209 @@ async def test_aux_accepts_follow_up_generation(fake_aux_module):
     body = json.loads(resp.body)
     assert 'follow_ups' in body['choices'][0]['message']['content']
     assert body['usage'] == {}  # usage None → empty dict
+
+
+@pytest.mark.asyncio
+async def test_title_generation_does_not_promote_reasoning_content(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = None
+    mock_response.choices[0].message.reasoning_content = (
+        'First, the user asks me to generate a concise title. '
+        'The final answer should be Paris Travel Planning.'
+    )
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+        'max_tokens': 160,
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == ''
+
+
+@pytest.mark.asyncio
+async def test_follow_up_generation_does_not_promote_reasoning(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = ''
+    mock_response.choices[0].message.reasoning = (
+        'I should suggest follow-up questions. '
+        '{"follow_ups": ["What else should I know?"]}'
+    )
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('follow_up_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate follow-ups'}],
+        'response_format': {'type': 'json_object'},
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == ''
+
+
+@pytest.mark.asyncio
+async def test_aux_endpoint_does_not_promote_reasoning_details(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = None
+    mock_response.choices[0].message.reasoning_details = [
+        {'summary': '{"title": "Reasoning Leak"}'},
+    ]
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == ''
+
+
+@pytest.mark.asyncio
+async def test_title_generation_visible_content_wins_over_reasoning(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = 'Paris Travel Planning'
+    mock_response.choices[0].message.reasoning_content = 'I need to produce a concise title.'
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == 'Paris Travel Planning'
+
+
+@pytest.mark.asyncio
+async def test_follow_up_generation_visible_content_wins_over_reasoning(fake_aux_module):
+    adapter = _make_adapter()
+
+    content = '{"follow_ups": ["Where should I stay?"]}'
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = content
+    mock_response.choices[0].message.reasoning = 'I should suggest follow-up questions.'
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('follow_up_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate follow-ups'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == content
+
+
+@pytest.mark.asyncio
+async def test_aux_endpoint_strips_inline_think_block_from_visible_content(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = '<think>I should generate a title</think>Paris Travel Planning'
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == 'Paris Travel Planning'
+
+
+@pytest.mark.asyncio
+async def test_aux_endpoint_think_only_content_does_not_fall_back_to_reasoning(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = '<think>I should generate a title</think>'
+    mock_response.choices[0].message.reasoning_content = 'Paris Travel Planning'
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['choices'][0]['message']['content'] == ''
+
+
+@pytest.mark.asyncio
+async def test_aux_endpoint_content_parts_keep_only_visible_text(fake_aux_module):
+    adapter = _make_adapter()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = [
+        {'type': 'reasoning', 'text': 'SECRET_CHAIN_OF_THOUGHT'},
+        {'type': 'text', 'text': '<think>scratchpad</think>Visible Title'},
+        {'type': 'output_text', 'text': {'value': ' from parts'}},
+        {'type': 'unknown', 'text': 'UNKNOWN_INTERNAL_METADATA'},
+        object(),
+    ]
+    mock_response.choices[0].finish_reason = 'stop'
+    mock_response.usage = None
+    fake_aux_module.async_call_llm = AsyncMock(return_value=mock_response)
+
+    request = _make_aux_request('title_generation', {
+        'messages': [{'role': 'user', 'content': 'Generate title'}],
+    })
+
+    resp = await adapter._handle_aux_endpoint(request)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    content = body['choices'][0]['message']['content']
+    assert content == 'Visible Title from parts'
+    assert 'SECRET_CHAIN_OF_THOUGHT' not in content
+    assert 'UNKNOWN_INTERNAL_METADATA' not in content
+    assert "'type':" not in content
 
 
 @pytest.mark.asyncio
