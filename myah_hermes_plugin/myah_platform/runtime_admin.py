@@ -307,8 +307,13 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         # providers, populated whenever the user runs setup or adds a
         # credential. The legacy ``providers`` key only carries OAuth
         # tokens; the env-var heuristic still applies for api_key types.
-        import os as _os
         import json as _json
+        try:
+            from hermes_cli.config import load_env as _load_env_file
+        except Exception:
+            import os as _os
+            def _load_env_file() -> dict:  # type: ignore[misc]
+                return dict(_os.environ)
         _auth_providers: set[str] = set()
         _auth_pool: set[str] = set()
         try:
@@ -342,8 +347,9 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
             # Legacy OAuth path: top-level `providers` entry
             elif auth_type.startswith("oauth") and slug in _auth_providers:
                 has_credential = True
-            # API-key fallback: env var is set in the process environment
-            elif auth_type == "api_key" and env_var and _os.environ.get(env_var):
+            # API-key fallback: env var is set in ~/.hermes/.env (mtime-cached
+            # file read — cross-process accurate after disconnect rewrites the file).
+            elif auth_type == "api_key" and env_var and _load_env_file().get(env_var):
                 has_credential = True
 
             providers_list.append({

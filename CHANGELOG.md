@@ -84,6 +84,55 @@ spec). The CI guards make the swap auditable — when a public surface
 lands, delete the corresponding private access path and its guard test
 in the same PR.
 
+## [1.1.2] — 2026-05-21
+
+### Fixed
+
+- **`fix(runtime_admin)`: Settings → Disconnect silently no-ops for env-var-backed
+  providers (OpenRouter, xAI, Anthropic, etc.) in OSS (T3-1043).**
+
+  `get_provider_catalog()` in `runtime_admin.py` computed `has_credential` for
+  `api_key` providers by calling `_os.environ.get(env_var)` — reading the
+  gateway process's own environment, which is set once at startup and never
+  mutated. When the user disconnects a provider, the platform calls
+  `remove_env_value()` which rewrites `~/.hermes/.env` in a subprocess without
+  touching the live gateway's `os.environ`. The stale process env then caused
+  `has_credential` to remain `True` indefinitely: the UI badge stayed green, the
+  next page-load still showed Connected, and the credential was never actually
+  removed from the agent's perspective.
+
+  Fix: replace `_os.environ.get(env_var)` with `_load_env_file().get(env_var)`
+  where `_load_env_file` is `hermes_cli.config.load_env` — an mtime-cached dict
+  parsed from `~/.hermes/.env` that is always cross-process accurate.
+
+  **Trade-off**: env-var providers configured exclusively via shell `export`
+  (i.e. the key is in the host shell environment but was never written to
+  `~/.hermes/.env` by `hermes auth` or the setup wizard) will now show as
+  *not connected* in the Settings UI even though Hermes can still use the key at
+  runtime. This is an intentional consequence: `~/.hermes/.env` is the
+  canonical credential store; shell-export-only keys bypass that contract and are
+  undiscoverable by the platform without reading the live process env.
+  This edge case is documented in `docs/gotchas/` on the platform repo.
+
+### Tests
+
+- 9 new regression tests in `tests/test_runtime_admin_providers.py` (T3-1043
+  block), covering:
+  - T-1: key in `os.environ` but absent from `.env` → `has_credential=False`
+  - T-2: key in both `os.environ` and `.env` → `True` (connected state)
+  - T-3: key in `.env` only (not in `os.environ`) → `True` (clean-install path)
+  - T-4: subprocess removes key from `.env`; `os.environ` unchanged → `False`
+    (cross-process integration test mirroring production disconnect flow)
+  - T-5: `credential_pool` short-circuit unaffected by fix
+  - T-6: OAuth provider path unaffected
+  - T-7: `null`/empty/absent `env_var` field → `False`, no exception
+  - T-8: missing `.env` file entirely → `False`, no exception (fresh-install)
+  - T-9: multi-provider non-interference — disconnecting B leaves A connected
+- All 9 use per-test unique synthetic env-var names (`T3_1043_T*_KEY`) to
+  prevent ambient shell variable bleed in CI or dev environments.
+- Updated `test_providers_lists_env_var_credentialed` to write the key to `.env`
+  (not only to `os.environ`) to match the new source-of-truth semantics.
+
 ## [1.1.1] — 2026-05-20
 
 ### Fixed
