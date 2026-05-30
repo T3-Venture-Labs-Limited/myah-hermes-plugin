@@ -12,11 +12,8 @@ new file to the platform's run-complete webhook. Tests cover:
 """
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -426,4 +423,3 @@ async def test_watcher_prefers_myah_metadata_over_native_origin(fake_output_dir,
 
     assert len(posted) == 1
     assert posted[0]["chat_id"] == "adopted-chat"
-

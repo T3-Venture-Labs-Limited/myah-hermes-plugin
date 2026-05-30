@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from cron import jobs as cron_jobs
 

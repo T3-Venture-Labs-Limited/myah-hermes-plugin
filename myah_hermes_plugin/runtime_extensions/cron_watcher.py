@@ -52,7 +52,6 @@ import json
 import logging
 import os
 import tempfile
-import time
 import urllib.request
 from datetime import datetime, timezone
 from enum import Enum
@@ -62,6 +61,8 @@ from urllib.parse import urljoin
 
 import aiohttp
 
+from cron.jobs import OUTPUT_DIR, load_jobs
+
 
 class DeliveryResult(str, Enum):
     """Tri-state delivery outcome for watcher seen-state semantics."""
@@ -69,8 +70,6 @@ class DeliveryResult(str, Enum):
     DELIVERED = "delivered"
     SKIPPED = "skipped"
     RETRY = "retry"
-
-from cron.jobs import OUTPUT_DIR, load_jobs
 
 logger = logging.getLogger(__name__)
 
