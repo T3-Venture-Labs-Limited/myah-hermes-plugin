@@ -55,11 +55,20 @@ import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
 
 import aiohttp
+
+
+class DeliveryResult(str, Enum):
+    """Tri-state delivery outcome for watcher seen-state semantics."""
+
+    DELIVERED = "delivered"
+    SKIPPED = "skipped"
+    RETRY = "retry"
 
 from cron.jobs import OUTPUT_DIR, load_jobs
 
@@ -486,10 +495,10 @@ async def _tick(base_url: str, bearer: str) -> None:
         # (and every subsequent restart-then-load) would skip the
         # file forever. That's the persistent-state version of the
         # same data-loss class this PR is fixing.
-        delivered = await _deliver(
+        result = await _deliver(
             base_url, bearer, jobs_by_id.get(job_id, {}), job_id, output_file
         )
-        if delivered:
+        if result in (DeliveryResult.DELIVERED, DeliveryResult.SKIPPED):
             _seen_mtimes[output_file] = mtime
             state_dirty = True
     if state_dirty:
@@ -498,51 +507,56 @@ async def _tick(base_url: str, bearer: str) -> None:
 
 async def _deliver(
     base_url: str, bearer: str, job: dict, job_id: str, output_file: Path
-) -> bool:
+) -> DeliveryResult:
     """Deliver one cron-output file to the platform webhook.
 
-    Returns:
-        * ``True`` — the webhook returned 2xx and accepted the output.
-          The caller MUST persist this file as seen.
-        * ``False`` — anything else (non-myah origin / skip, file
-          unreadable, missing chat_id, HTTP non-2xx, network exception).
-          The caller MUST NOT persist; the file will be retried on a
-          subsequent tick (or after a restart that reloads state).
+    Returns a tri-state result so ``_tick`` can persist intentional skips
+    without treating transient platform failures as delivered:
 
-    The split-return is the safety contract for the persistent
-    seen-state: ``_tick`` only writes ``.watcher-seen.json`` for files
-    this function confirms delivered, so transient platform failures
-    don't get baked in as permanent "delivered" records.
+    * ``DELIVERED`` — webhook accepted the output; mark seen.
+    * ``SKIPPED`` — intentional non-retryable skip (for example an external
+      non-adopted cron); mark seen to avoid future replay/backfill duplicates.
+    * ``RETRY`` — webhook/network/platform failure, unreadable output files, or
+      Myah/adopted jobs whose chat metadata is temporarily missing; do not mark
+      seen.
     """
     origin = job.get("origin") or {}
-    if not isinstance(origin, dict) or origin.get("platform") != "myah":
-        # Non-myah cron jobs are delivered by their own adapters. Skip
-        # cleanly (not a failure to re-attempt).
-        return False
+    myah = job.get("myah") or {}
+    origin_is_myah = isinstance(origin, dict) and origin.get("platform") == "myah"
+    adopted_chat_id = myah.get("chat_id") if isinstance(myah, dict) else None
+    chat_id = adopted_chat_id or (origin.get("chat_id") if origin_is_myah else None)
+
+    if not origin_is_myah and not adopted_chat_id:
+        # Non-myah cron jobs are delivered by their own adapters. This is an
+        # intentional skip, not a transient failure; record it as seen so a
+        # later explicit adoption + platform backfill does not replay the file.
+        return DeliveryResult.SKIPPED
 
     try:
         content = output_file.read_text(encoding="utf-8")
     except Exception:
         logger.exception("cron watcher: failed to read %s", output_file)
-        return False
+        return DeliveryResult.RETRY
 
     payload = {
         "user_id": os.environ.get("MYAH_USER_ID", ""),
         "job_id": job_id,
         "job_name": job.get("name") or job_id,
-        "chat_id": origin.get("chat_id", ""),
+        "chat_id": chat_id or "",
         "response": content,
         "status": job.get("last_status") or "ok",
         "ran_at": datetime.fromtimestamp(
             output_file.stat().st_mtime, tz=timezone.utc
         ).isoformat(),
+        "run_id": output_file.stem,
         "tool_calls_log": None,  # not available on disk; accepted degradation
+        "origin": origin if isinstance(origin, dict) else {},
     }
     if not payload["chat_id"]:
         logger.warning(
-            "cron watcher: job %s has myah origin but no chat_id; skipping", job_id
+            "cron watcher: job %s has myah routing but no chat_id; retrying", job_id
         )
-        return False
+        return DeliveryResult.RETRY
 
     url = f"{base_url}/api/v1/processes/webhook/run-complete"
     timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECS)
@@ -559,12 +573,12 @@ async def _deliver(
                         job_id, payload["chat_id"], resp.status,
                     )
                     _on_post_success()
-                    return True
+                    return DeliveryResult.DELIVERED
                 _on_post_failure(job_id, f"HTTP {resp.status}")
-                return False
+                return DeliveryResult.RETRY
     except Exception as exc:
         _on_post_failure(job_id, str(exc) or type(exc).__name__)
-        return False
+        return DeliveryResult.RETRY
 
 
 _started = False
