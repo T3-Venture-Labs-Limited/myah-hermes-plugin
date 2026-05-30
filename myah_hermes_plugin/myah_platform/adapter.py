@@ -1108,9 +1108,13 @@ class MyahAdapter(BasePlatformAdapter):
                 self._session_streams.pop(session_key, None)
                 self._stream_sessions.pop(stream_id, None)
 
-                # Phase F: clean up streaming workaround state
+                # Phase F: clean up streaming workaround state. Keep
+                # _chat_id_message_ids past stream cleanup: gateway final
+                # adapter.send(...) can arrive after the SSE stream/queue has
+                # disappeared, and the durable /messages/final fallback needs
+                # the original platform assistant message_id. It is overwritten
+                # on the next turn for this chat and swept on adapter shutdown.
                 self._chat_id_session_keys.pop(chat_id, None)
-                self._chat_id_message_ids.pop(chat_id, None)
                 self._native_streaming_used.discard(session_key)
                 self._stream_delta_invoked.discard(session_key)
                 self._stream_had_content.discard(stream_id)
@@ -1821,7 +1825,9 @@ class MyahAdapter(BasePlatformAdapter):
                 ]
                 for cid in stale_chat_ids:
                     self._chat_id_streams.pop(cid, None)
-                    self._chat_id_message_ids.pop(cid, None)
+                    # Keep _chat_id_message_ids for the durable final-message
+                    # fallback; stale-stream sweeping can race with gateway
+                    # final adapter.send(...) on long/non-streaming turns.
                 # Close the queue if anyone is listening
                 if q is not None:
                     try:
@@ -2112,6 +2118,7 @@ class MyahAdapter(BasePlatformAdapter):
         self._session_streams.clear()
         self._chat_id_streams.clear()
         self._stream_sessions.clear()
+        self._chat_id_message_ids.clear()
 
         # Tear down the plugin-owned aiohttp runner.  Helper handles
         # both ``TCPSite.stop()`` and ``AppRunner.cleanup()`` and is
@@ -2443,6 +2450,19 @@ class MyahAdapter(BasePlatformAdapter):
             or self._chat_id_message_ids.get(chat_id)
             or ''
         )
+        if not message_id:
+            logger.warning(
+                "[myah] final-message fallback unavailable: missing message_id "
+                "chat_id=%s",
+                chat_id,
+            )
+            return SendResult(
+                success=False,
+                error=(
+                    f"No active stream for chat_id={chat_id}; "
+                    "Missing message_id for durable final-message fallback"
+                ),
+            )
         session_key = self._chat_id_session_keys.get(chat_id) or ''
         model = ''
         provider = ''

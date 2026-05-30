@@ -425,6 +425,73 @@ async def test_send_persists_live_reply_when_stream_queue_missing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_persists_live_reply_when_stream_mapping_missing(monkeypatch):
+    """If stream mappings were cleaned before final send, use saved message_id."""
+    adapter = _make_adapter()
+    adapter._loop = asyncio.get_running_loop()
+    adapter._chat_id_message_ids[_CHAT_ID] = 'assistant-msg-1'
+
+    monkeypatch.setenv('MYAH_PLATFORM_BASE_URL', _PLATFORM_BASE_URL)
+    monkeypatch.setenv('MYAH_PLATFORM_BEARER', _PLATFORM_BEARER)
+    monkeypatch.setenv('MYAH_USER_ID', _USER_ID)
+
+    recorder = _RecordingClientSession()
+    with patch('aiohttp.ClientSession', return_value=recorder):
+        result = await adapter.send(_CHAT_ID, 'final live reply')
+
+    assert result.success is True, result.error
+    assert recorder.posts, 'missing stream mapping must call durable final-message endpoint'
+    post = recorder.posts[0]
+    assert post['url'].endswith('/api/v1/myah/messages/final')
+    assert post['json']['user_id'] == _USER_ID
+    assert post['json']['chat_id'] == _CHAT_ID
+    assert post['json']['message_id'] == 'assistant-msg-1'
+    assert post['json']['response'] == 'final live reply'
+
+
+@pytest.mark.asyncio
+async def test_send_final_fallback_missing_message_id_does_not_post(monkeypatch):
+    """Never POST an empty message_id; platform rejects it with a 400."""
+    adapter = _make_adapter()
+    adapter._loop = asyncio.get_running_loop()
+
+    monkeypatch.setenv('MYAH_PLATFORM_BASE_URL', _PLATFORM_BASE_URL)
+    monkeypatch.setenv('MYAH_PLATFORM_BEARER', _PLATFORM_BEARER)
+    monkeypatch.setenv('MYAH_USER_ID', _USER_ID)
+
+    recorder = _RecordingClientSession()
+    with patch('aiohttp.ClientSession', return_value=recorder):
+        result = await adapter.send(_CHAT_ID, 'final live reply')
+
+    assert result.success is False
+    assert 'Missing message_id' in (result.error or '')
+    assert recorder.posts == []
+
+
+@pytest.mark.asyncio
+async def test_send_final_fallback_metadata_message_id_wins(monkeypatch):
+    """An explicit message_id in send metadata overrides the cached chat value."""
+    adapter = _make_adapter()
+    adapter._loop = asyncio.get_running_loop()
+    adapter._chat_id_message_ids[_CHAT_ID] = 'cached-msg'
+
+    monkeypatch.setenv('MYAH_PLATFORM_BASE_URL', _PLATFORM_BASE_URL)
+    monkeypatch.setenv('MYAH_PLATFORM_BEARER', _PLATFORM_BEARER)
+    monkeypatch.setenv('MYAH_USER_ID', _USER_ID)
+
+    recorder = _RecordingClientSession()
+    with patch('aiohttp.ClientSession', return_value=recorder):
+        result = await adapter.send(
+            _CHAT_ID,
+            'final live reply',
+            metadata={'message_id': 'metadata-msg'},
+        )
+
+    assert result.success is True, result.error
+    assert recorder.posts[0]['json']['message_id'] == 'metadata-msg'
+
+
+@pytest.mark.asyncio
 async def test_send_preserves_no_active_stream_when_final_endpoint_unconfigured(monkeypatch):
     """Without platform fallback env, retain legacy error shape."""
     adapter = _make_adapter()
