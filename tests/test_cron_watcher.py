@@ -12,11 +12,8 @@ new file to the platform's run-complete webhook. Tests cover:
 """
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -108,6 +105,7 @@ async def test_new_file_triggers_webhook(fake_output_dir, fake_jobs, monkeypatch
     assert "Daily summary" in payload["response"]
     assert payload["status"] == "ok"
     assert payload["tool_calls_log"] is None
+    assert payload["run_id"] == "2026-05-10_12-00-00"
 
 
 @pytest.mark.asyncio
@@ -194,3 +192,234 @@ def test_vanilla_api_ci_guard():
     assert callable(cron_jobs.load_jobs)
     # Path layout assumption: OUTPUT_DIR / {job_id} / {timestamp}.md
     assert isinstance(cron_jobs.OUTPUT_DIR, Path)
+
+@pytest.mark.asyncio
+async def test_watcher_delivers_adopted_job_with_myah_chat_id(fake_output_dir, monkeypatch):
+    """A legacy cron with external origin but job.myah.chat_id is delivered
+    to Myah without overwriting/paying attention to native origin."""
+    adopted_job = {
+        "id": "abc123def456",
+        "name": "adopted-cron",
+        "origin": {"platform": "telegram", "chat_id": "tg-chat"},
+        "myah": {"chat_id": "myah-chat-1"},
+    }
+    monkeypatch.setattr(
+        "myah_hermes_plugin.runtime_extensions.cron_watcher.load_jobs",
+        lambda: [adopted_job],
+    )
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    (job_dir / "2026-05-10_12-00-00.md").write_text("adopted output")
+
+    posted = []
+
+    class FakeResponse:
+        status = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def post(self, url, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "aiohttp.ClientSession",
+        FakeSession,
+    )
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert len(posted) == 1
+    assert posted[0]["json"]["job_id"] == "abc123def456"
+    assert posted[0]["json"]["chat_id"] == "myah-chat-1"
+    assert posted[0]["json"]["origin"]["platform"] == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_non_myah_skipped_files_are_marked_seen_not_retried(fake_output_dir, monkeypatch):
+    """External, non-adopted jobs are intentional skips and should be
+    recorded as seen so adoption/backfill does not later replay them."""
+    external_job = {
+        "id": "abc123def456",
+        "name": "telegram-cron",
+        "origin": {"platform": "telegram", "chat_id": "tg-chat"},
+    }
+    monkeypatch.setattr(
+        "myah_hermes_plugin.runtime_extensions.cron_watcher.load_jobs",
+        lambda: [external_job],
+    )
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    output_file = job_dir / "2026-05-10_12-00-00.md"
+    output_file.write_text("telegram output")
+
+    posted = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def post(self, url, json=None, headers=None):
+            posted.append(json)
+            raise AssertionError("external non-adopted cron should not post")
+
+    monkeypatch.setattr(
+        "aiohttp.ClientSession",
+        FakeSession,
+    )
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert posted == []
+    assert cron_watcher._seen_mtimes.get(output_file) == output_file.stat().st_mtime
+
+
+@pytest.mark.asyncio
+async def test_transient_webhook_failure_is_not_marked_seen(fake_output_dir, fake_jobs, monkeypatch):
+    """A Myah/adopted job with a transient webhook failure remains retryable."""
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    output_file = job_dir / "2026-05-10_12-00-00.md"
+    output_file.write_text("myah output")
+
+    class FakeResponse:
+        status = 502
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def post(self, url, json=None, headers=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "aiohttp.ClientSession",
+        FakeSession,
+    )
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert output_file not in cron_watcher._seen_mtimes
+
+
+@pytest.mark.asyncio
+async def test_unreadable_myah_output_file_is_retryable(fake_output_dir, fake_jobs, monkeypatch):
+    """A temporary filesystem/read error must not permanently mark a Myah
+    delivery as seen. The next tick should get another chance to post it."""
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    output_file = job_dir / "2026-05-10_12-00-00.md"
+    output_file.write_text("myah output")
+
+    original_read_text = Path.read_text
+
+    def fail_output_read(self, *args, **kwargs):
+        if self == output_file:
+            raise OSError("temporary read failure")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_output_read)
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert output_file not in cron_watcher._seen_mtimes
+
+
+@pytest.mark.asyncio
+async def test_myah_routed_job_missing_chat_id_is_retryable(fake_output_dir, monkeypatch):
+    """Missing Myah chat metadata is repairable (for example while adoption
+    metadata is being written), so do not permanently skip the output."""
+    job = {
+        "id": "abc123def456",
+        "name": "half-adopted-cron",
+        "origin": {"platform": "myah"},
+    }
+    monkeypatch.setattr(
+        "myah_hermes_plugin.runtime_extensions.cron_watcher.load_jobs",
+        lambda: [job],
+    )
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    output_file = job_dir / "2026-05-10_12-00-00.md"
+    output_file.write_text("myah output")
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert output_file not in cron_watcher._seen_mtimes
+
+@pytest.mark.asyncio
+async def test_watcher_prefers_myah_metadata_over_native_origin(fake_output_dir, monkeypatch):
+    """Adoption metadata is the Myah-owned routing source of truth; when both
+    native origin and job.myah exist, route to job.myah.chat_id."""
+    job = {
+        "id": "abc123def456",
+        "name": "repair-cron",
+        "origin": {"platform": "myah", "chat_id": "stale-origin-chat"},
+        "myah": {"chat_id": "adopted-chat"},
+    }
+    monkeypatch.setattr(
+        "myah_hermes_plugin.runtime_extensions.cron_watcher.load_jobs",
+        lambda: [job],
+    )
+    job_dir = fake_output_dir / "abc123def456"
+    job_dir.mkdir()
+    (job_dir / "2026-05-10_13-00-00.md").write_text("repair output")
+
+    posted = []
+
+    class FakeResponse:
+        status = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def post(self, url, json=None, headers=None):
+            posted.append(json)
+            return FakeResponse()
+
+    monkeypatch.setattr("aiohttp.ClientSession", FakeSession)
+
+    from myah_hermes_plugin.runtime_extensions import cron_watcher
+    cron_watcher._seen_mtimes.clear()
+    await cron_watcher._tick("http://platform.test", "test-token")
+
+    assert len(posted) == 1
+    assert posted[0]["chat_id"] == "adopted-chat"
