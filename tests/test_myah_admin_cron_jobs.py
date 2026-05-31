@@ -1,4 +1,4 @@
-"""Tests for myah-admin cron job metadata patch endpoint."""
+"""Tests for myah-admin cron job metadata and output endpoints."""
 from __future__ import annotations
 
 import copy
@@ -107,3 +107,30 @@ def test_patch_myah_metadata_returns_404_for_missing_job(monkeypatch):
     with patch.object(_cron_jobs.cron_jobs, "load_jobs", return_value=[]):
         resp = client.post("/cron/jobs/abcdef012345/myah-metadata", json={"myah": {"chat_id": "c"}})
     assert resp.status_code == 404
+
+
+def test_get_outputs_returns_newest_first_parsed_run_files(monkeypatch, tmp_path):
+    client = _client(monkeypatch)
+    output_dir = tmp_path / "cron" / "output"
+    job_dir = output_dir / "abcdef012345"
+    job_dir.mkdir(parents=True)
+    older = job_dir / "2026-05-31_08-00-00.md"
+    newer = job_dir / "2026-05-31_09-00-00.md"
+    older.write_text("## Prompt\nold prompt\n\n## Response\nold response", encoding="utf-8")
+    newer.write_text("## Prompt\nnew prompt\n\n## Response\nnew response", encoding="utf-8")
+
+    with patch.object(_cron_jobs.cron_jobs, "OUTPUT_DIR", output_dir):
+        resp = client.get("/cron/jobs/abcdef012345/outputs?limit=2")
+
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["runs"]
+    assert [r["id"] for r in runs] == ["2026-05-31_09-00-00", "2026-05-31_08-00-00"]
+    assert runs[0]["response"] == "new response"
+    assert runs[0]["prompt"] == "new prompt"
+    assert runs[0]["ran_at"] == "2026-05-31T09:00:00+00:00"
+
+
+def test_get_outputs_rejects_invalid_job_id(monkeypatch):
+    client = _client(monkeypatch)
+    resp = client.get("/cron/jobs/../etc/outputs")
+    assert resp.status_code in (404, 422)
