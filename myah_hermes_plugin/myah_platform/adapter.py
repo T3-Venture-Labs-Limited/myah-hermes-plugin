@@ -1749,6 +1749,8 @@ class MyahAdapter(BasePlatformAdapter):
             "tool_progress": _tool_progress,
             "tool_start": _tool_start,
             "tool_complete": _tool_complete,
+            "tool_start_callback": _tool_start,
+            "tool_complete_callback": _tool_complete,
             "reasoning": _reasoning,
             "status": _status,
         }

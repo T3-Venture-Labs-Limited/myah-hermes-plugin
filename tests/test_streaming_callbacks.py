@@ -524,6 +524,8 @@ def test_aiagent_has_structured_callback_attrs():
     expected = [
         "stream_delta_callback",
         "tool_progress_callback",
+        "tool_start_callback",
+        "tool_complete_callback",
         "status_callback",
         "reasoning_callback",
     ]

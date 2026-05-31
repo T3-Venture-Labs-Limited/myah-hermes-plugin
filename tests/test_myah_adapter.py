@@ -11,6 +11,7 @@ Tests cover:
 """
 
 import asyncio
+import json
 import pytest
 from unittest.mock import MagicMock
 
@@ -392,11 +393,63 @@ class TestStructuredCallbacks:
 
         cbs = adapter.get_structured_callbacks(session_key)
         assert cbs is not None
-        expected = {"stream_delta", "tool_progress", "tool_start", "tool_complete", "reasoning", "status"}
-        assert expected <= set(cbs)
+        assert set(cbs.keys()) == {
+            "stream_delta",
+            "tool_progress",
+            "tool_start",
+            "tool_complete",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "reasoning",
+            "status",
+        }
         assert callable(cbs["tool_start"])
         assert callable(cbs["tool_complete"])
         adapter._loop.close()
+
+    def test_get_structured_callbacks_exposes_tool_start_and_complete(self):
+        adapter = _make_adapter()
+        adapter._loop = asyncio.new_event_loop()
+        stream_id = "stream-structured-tools"
+        session_key = "agent:main:myah:dm:chat-tools"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = asyncio.Queue()
+
+        cbs = adapter.get_structured_callbacks(session_key)
+
+        assert cbs is not None
+        assert {"tool_start", "tool_complete"} <= cbs.keys()
+        assert cbs["tool_start_callback"] is cbs["tool_start"]
+        assert cbs["tool_complete_callback"] is cbs["tool_complete"]
+        adapter._loop.close()
+
+    def test_tool_complete_callback_emits_real_todo_result_and_call_id(self):
+        adapter = _make_adapter()
+        loop = asyncio.new_event_loop()
+        adapter._loop = loop
+        q = asyncio.Queue()
+        stream_id = "stream-tool-complete"
+        session_key = "agent:main:myah:dm:chat-tool-complete"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = q
+        exact_result = '{"todos":[{"id":"1","content":"Plan work","status":"in_progress"}]}'
+
+        cbs = adapter.get_structured_callbacks(session_key)
+        cbs["tool_complete"](
+            "call_todo_1",
+            "todo",
+            {"todos": [{"id": "1", "content": "Plan work", "status": "in_progress"}]},
+            exact_result,
+        )
+        loop.run_until_complete(asyncio.sleep(0))
+
+        event = q.get_nowait()
+        assert event["event"] == "tool.completed"
+        assert event["tool"] == "todo"
+        assert event["call_id"] == "call_todo_1"
+        assert event["result"] == exact_result
+        assert json.loads(event["result"])["todos"][0]["content"] == "Plan work"
+        loop.close()
 
     def test_stream_delta_pushes_event(self):
         adapter = _make_adapter()

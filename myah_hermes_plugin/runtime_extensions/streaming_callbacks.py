@@ -248,8 +248,12 @@ def myah_pre_llm_call(
         agent.tool_progress_callback = cbs["tool_progress"]
     if "tool_start" in cbs:
         agent.tool_start_callback = cbs["tool_start"]
+    elif "tool_start_callback" in cbs:
+        agent.tool_start_callback = cbs["tool_start_callback"]
     if "tool_complete" in cbs:
         agent.tool_complete_callback = cbs["tool_complete"]
+    elif "tool_complete_callback" in cbs:
+        agent.tool_complete_callback = cbs["tool_complete_callback"]
     if "status" in cbs:
         agent.status_callback = cbs["status"]
     if "reasoning" in cbs and hasattr(agent, "reasoning_callback"):
