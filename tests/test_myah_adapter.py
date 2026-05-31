@@ -187,10 +187,8 @@ class TestFormatToolEvent:
     def test_tool_started(self):
         args = ("tool.started", "web_search", "Searching for...", {"query": "test"})
         result = self._fmt(self.stream_id, args, {})
-        assert result["event"] == "tool.started"
-        assert result["tool"] == "web_search"
-        assert result["preview"] == "Searching for..."
-        assert result["args"] == {"query": "test"}
+        assert result["event"] == "status"
+        assert result["text"] == "Searching for..."
         assert result["run_id"] == self.stream_id
         assert result["stream_id"] == self.stream_id
 
@@ -198,10 +196,8 @@ class TestFormatToolEvent:
         args = ("tool.completed", "web_search", None, None)
         kwargs = {"duration": 1.5, "is_error": False}
         result = self._fmt(self.stream_id, args, kwargs)
-        assert result["event"] == "tool.completed"
-        assert result["tool"] == "web_search"
-        assert result["duration"] == 1.5
-        assert result["error"] is False
+        assert result["event"] == "status"
+        assert result["text"] == "None"
         assert result["run_id"] == self.stream_id
 
     def test_thinking(self):
@@ -232,16 +228,18 @@ class TestFormatToolEvent:
         assert result["run_id"] == self.stream_id
 
     def test_tool_started_non_dict_args(self):
-        """Non-dict args[3] should fall back to empty dict."""
+        """Legacy name-keyed tool.start becomes status to avoid duplicates."""
         args = ("tool.started", "terminal", "Running command", "not-a-dict")
         result = self._fmt(self.stream_id, args, {})
-        assert result["args"] == {}
+        assert result["event"] == "status"
+        assert result["text"] == "Running command"
 
     def test_tool_started_with_none_preview(self):
-        """None preview should become empty string."""
+        """Legacy tool events should not generate duplicate function rows."""
         args = ("tool.started", "file_read", None, {"path": "/tmp"})
         result = self._fmt(self.stream_id, args, {})
-        assert result["preview"] == ""
+        assert result["event"] == "status"
+        assert result["text"] == "None"
 
 
 # ── send() and send_typing() ───────────────────────────────────────────────
@@ -384,7 +382,7 @@ class TestStructuredCallbacks:
         result = adapter.get_structured_callbacks("nonexistent-session-key")
         assert result is None
 
-    def test_returns_dict_with_four_callbacks(self):
+    def test_returns_dict_with_structured_tool_callbacks(self):
         adapter = _make_adapter()
         adapter._loop = asyncio.new_event_loop()
         stream_id = "stream-cb-test"
@@ -394,7 +392,10 @@ class TestStructuredCallbacks:
 
         cbs = adapter.get_structured_callbacks(session_key)
         assert cbs is not None
-        assert set(cbs.keys()) == {"stream_delta", "tool_progress", "reasoning", "status"}
+        expected = {"stream_delta", "tool_progress", "tool_start", "tool_complete", "reasoning", "status"}
+        assert expected <= set(cbs)
+        assert callable(cbs["tool_start"])
+        assert callable(cbs["tool_complete"])
         adapter._loop.close()
 
     def test_stream_delta_pushes_event(self):
@@ -435,6 +436,60 @@ class TestStructuredCallbacks:
         loop.run_until_complete(asyncio.sleep(0))
 
         assert q.empty()
+        loop.close()
+    def test_structured_tool_start_pushes_real_call_id_event(self):
+        adapter = _make_adapter()
+        loop = asyncio.new_event_loop()
+        adapter._loop = loop
+        q = asyncio.Queue()
+        stream_id = "stream-tool-start-test"
+        session_key = "agent:main:myah:dm:tool-start-chat"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = q
+
+        cbs = adapter.get_structured_callbacks(session_key)
+        cbs["tool_start"]("call_abc123", "search_files", {"pattern": "tool_start"})
+        loop.run_until_complete(asyncio.sleep(0))
+
+        event = q.get_nowait()
+        assert event["event"] == "tool.started"
+        assert event["stream_id"] == stream_id
+        assert event["run_id"] == stream_id
+        assert event["timestamp"]
+        assert event["call_id"] == "call_abc123"
+        assert event["tool"] == "search_files"
+        assert event["args"] == {"pattern": "tool_start"}
+        assert "preview" in event
+        loop.close()
+
+    def test_structured_tool_complete_pushes_real_call_id_event(self):
+        adapter = _make_adapter()
+        loop = asyncio.new_event_loop()
+        adapter._loop = loop
+        q = asyncio.Queue()
+        stream_id = "stream-tool-complete-test"
+        session_key = "agent:main:myah:dm:tool-complete-chat"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = q
+
+        cbs = adapter.get_structured_callbacks(session_key)
+        cbs["tool_complete"](
+            "call_abc123",
+            "search_files",
+            {"pattern": "tool_start"},
+            "found 3 matches",
+        )
+        loop.run_until_complete(asyncio.sleep(0))
+
+        event = q.get_nowait()
+        assert event["event"] == "tool.completed"
+        assert event["stream_id"] == stream_id
+        assert event["run_id"] == stream_id
+        assert event["timestamp"]
+        assert event["call_id"] == "call_abc123"
+        assert event["tool"] == "search_files"
+        assert event["args"] == {"pattern": "tool_start"}
+        assert event["result"] == "found 3 matches"
         loop.close()
 
 
@@ -525,7 +580,7 @@ class TestResolveRunner:
 
 class TestStreamHadContent:
     """``_stream_had_content`` is a per-stream_id set that flips True the
-    first time any ``message.delta`` event is pushed to the stream queue.
+    first time user-visible stream activity is pushed to the stream queue.
 
     The ``_dispatch_message`` finally block reads this to decide whether
     to emit the gateway-suppression-bug warning ("LLM call did not produce
@@ -547,22 +602,32 @@ class TestStreamHadContent:
         assert stream_id in adapter._stream_had_content
 
     def test_non_delta_events_do_not_mark_stream_had_content(self):
-        """Reasoning, status, tool events do NOT count as 'real content'.
-        The user only sees them as 'Thinking...' or tool cards — without
-        a message.delta the chat bubble stays empty."""
+        """Non-visible terminal/control events do not count as user-visible content."""
         adapter = _make_adapter()
         stream_id = "s-test-2"
         adapter._streams[stream_id] = asyncio.Queue()
         for ev_type in (
-            "reasoning.delta",
-            "status",
-            "tool.started",
-            "tool.completed",
             "run.completed",
             "run.failed",
         ):
             adapter._push_event_sync(stream_id, {"event": ev_type, "ts": 0})
         assert stream_id not in adapter._stream_had_content
+
+    def test_structured_activity_push_marks_stream_had_content(self):
+        """Visible tool/reasoning/status events prevent fallback Working text.
+
+        Regression guard for long runs and /steer: if a run has only
+        structured activity before final text, it still has visible user
+        progress and must not trigger the gateway-suppression fallback.
+        """
+        adapter = _make_adapter()
+        stream_id = "s-test-structured"
+        adapter._streams[stream_id] = asyncio.Queue()
+
+        for ev_type in adapter.CONTENTFUL_STREAM_EVENTS - {"message.delta"}:
+            adapter._stream_had_content.clear()
+            adapter._push_event_sync(stream_id, {"event": ev_type, "ts": 0})
+            assert stream_id in adapter._stream_had_content, ev_type
 
     def test_unknown_stream_id_does_not_explode(self):
         """If the stream_id is unknown (queue not present), _push_event_sync
@@ -645,12 +710,14 @@ class TestStreamDeltaCallbackMarksContent:
         )
 
     @pytest.mark.asyncio
-    async def test_non_delta_streaming_events_do_not_mark_content(self):
-        """``reasoning`` / ``status`` / ``tool_progress`` callbacks emit
-        non-delta events. They MUST NOT mark ``_stream_had_content`` —
-        otherwise the user-visible-content check would false-positive on
-        runs that only emitted reasoning/tool activity with no real
-        assistant message."""
+    async def test_visible_structured_streaming_events_mark_content(self):
+        """Reasoning/status/tool callbacks are visible activity in Myah.
+
+        They must mark ``_stream_had_content`` so a long tool-only phase or
+        /steer continuation does not get overwritten by the generic
+        gateway-suppression fallback while the UI already has useful timeline
+        rows to show.
+        """
         adapter = _make_adapter()
         session_key = "agent:main:myah:dm:session-2:user-2"
         stream_id = "stream-def"
@@ -668,11 +735,7 @@ class TestStreamDeltaCallbackMarksContent:
 
         await asyncio.sleep(0)
 
-        assert stream_id not in adapter._stream_had_content, (
-            "Non-message.delta events were tracked as user-visible content. "
-            "The suppression-bug check expects _stream_had_content to mean "
-            "'a real assistant message was delivered'."
-        )
+        assert stream_id in adapter._stream_had_content
 
 
 # ── Bug F: adapter.send must NOT misclassify regular replies as cron ──────

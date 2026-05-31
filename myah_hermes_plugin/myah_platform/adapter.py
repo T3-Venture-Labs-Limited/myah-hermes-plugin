@@ -296,6 +296,16 @@ class MyahAdapter(BasePlatformAdapter):
     GET /myah/v1/events/{stream_id} for real-time events.
     """
 
+    CONTENTFUL_STREAM_EVENTS = frozenset({
+        "message.delta",
+        "tool.started",
+        "tool.completed",
+        "tool.confirmation_required",
+        "reasoning.delta",
+        "reasoning.available",
+        "status",
+    })
+
     def __init__(self, config: PlatformConfig):
         # ``Platform.MYAH`` was removed from the core enum in Phase 4d
         # (2026-05-04). ``Platform("myah")`` resolves through the enum's
@@ -406,14 +416,12 @@ class MyahAdapter(BasePlatformAdapter):
         # emits the response as a synthetic message.delta event so the
         # user sees the error message inline.
         self._stream_delta_invoked: set[str] = set()
-        # Set of stream_ids that received AT LEAST ONE message.delta
-        # event via any delivery path — stream_delta callback, slash
-        # command response via adapter.send, agent reply via send,
-        # cron live-preview, etc. Tracked at _push_event_sync time so
-        # all paths get unified accounting. The gateway-suppression
-        # workaround in _dispatch_message finally reads this instead
-        # of _stream_delta_invoked (which only covers the LLM streaming
-        # path and would false-positive on slash commands).
+        # Set of stream_ids that received visible stream activity:
+        # message.delta text, structured tool rows, reasoning/status rows,
+        # slash command output via adapter.send, cron live-preview, etc.
+        # Tracked at push time so all paths get unified accounting. The
+        # gateway-suppression workaround reads this to avoid replacing an
+        # already-useful Myah timeline with a generic provider-warning fallback.
         self._stream_had_content: set[str] = set()
         # ─────────────────────────────────────────────────────────────
 
@@ -544,8 +552,9 @@ class MyahAdapter(BasePlatformAdapter):
         # this tracking, slash commands like /model would falsely trigger
         # the gateway-suppression warning because their response is
         # emitted via send() → _push_event_sync directly, bypassing the
-        # stream_delta_callback path that _stream_delta_invoked tracks.
-        if event.get("event") == "message.delta":
+        # Mark any user-visible stream activity so the final fallback does not
+        # replace detailed tool/status UI with a generic Working/error message.
+        if event.get("event") in self.CONTENTFUL_STREAM_EVENTS:
             self._stream_had_content.add(stream_id)
         try:
             q.put_nowait(event)
@@ -1019,10 +1028,10 @@ class MyahAdapter(BasePlatformAdapter):
                 # adapter.send entirely. User sees "Thinking..." forever.
                 #
                 # Detect this by checking ``_stream_had_content`` — a set of
-                # stream_ids that received at least one ``message.delta``
-                # via any delivery path (stream_delta callback, adapter.send
-                # for slash commands, agent reply via send, cron preview).
-                # If the stream got NO content events, the response was
+                # stream_ids that received visible stream activity (assistant
+                # text, structured tool rows, reasoning/status rows, slash
+                # command output via adapter.send, cron preview, etc.).
+                # If the stream got NO visible activity, the response was
                 # swallowed by the gateway bug — emit a generic warning so
                 # the user sees something instead of an empty Thinking
                 # spinner.
@@ -1663,7 +1672,11 @@ class MyahAdapter(BasePlatformAdapter):
             push went through the sync helper or the threadsafe queue
             primitive.
             """
-            if event_data.get("event") == "message.delta":
+            # Structured tool/reasoning/status events are also visible user
+            # activity. They should keep the stream from degrading to the
+            # gateway-suppression fallback after /steer or long tool-only
+            # phases where no assistant text has streamed yet.
+            if event_data.get("event") in self.CONTENTFUL_STREAM_EVENTS:
                 self._stream_had_content.add(stream_id)
             try:
                 self._loop.call_soon_threadsafe(q.put_nowait, event_data)
@@ -1701,6 +1714,16 @@ class MyahAdapter(BasePlatformAdapter):
         def _tool_progress(*args, **kwargs):
             _put(self._format_tool_event(stream_id, args, kwargs))
 
+        def _tool_start(tool_call_id, function_name, tool_args):
+            _put(self._format_tool_start_event(
+                stream_id, tool_call_id, function_name, tool_args
+            ))
+
+        def _tool_complete(tool_call_id, function_name, tool_args, result):
+            _put(self._format_tool_complete_event(
+                stream_id, tool_call_id, function_name, tool_args, result
+            ))
+
         def _reasoning(text):
             if not text:
                 return
@@ -1724,8 +1747,51 @@ class MyahAdapter(BasePlatformAdapter):
         return {
             "stream_delta": _stream_delta,
             "tool_progress": _tool_progress,
+            "tool_start": _tool_start,
+            "tool_complete": _tool_complete,
             "reasoning": _reasoning,
             "status": _status,
+        }
+
+    @staticmethod
+    def _format_tool_start_event(
+        stream_id: str,
+        tool_call_id: str,
+        function_name: str,
+        tool_args: Any,
+    ) -> dict:
+        """Format Hermes' structured tool_start_callback into an SSE event."""
+        return {
+            "event": "tool.started",
+            "stream_id": stream_id,
+            "run_id": stream_id,
+            "timestamp": time.time(),
+            "tool": function_name,
+            "call_id": tool_call_id,
+            "args": tool_args if isinstance(tool_args, dict) else {},
+            "preview": function_name or "",
+        }
+
+    @staticmethod
+    def _format_tool_complete_event(
+        stream_id: str,
+        tool_call_id: str,
+        function_name: str,
+        tool_args: Any,
+        result: Any,
+    ) -> dict:
+        """Format Hermes' structured tool_complete_callback into an SSE event."""
+        return {
+            "event": "tool.completed",
+            "stream_id": stream_id,
+            "run_id": stream_id,
+            "timestamp": time.time(),
+            "tool": function_name,
+            "call_id": tool_call_id,
+            "args": tool_args if isinstance(tool_args, dict) else {},
+            "result": result if isinstance(result, str) else str(result),
+            "duration": None,
+            "error": False,
         }
 
     @staticmethod
@@ -1745,29 +1811,16 @@ class MyahAdapter(BasePlatformAdapter):
 
         event_type = args[0]
 
-        if event_type == "tool.started" and len(args) >= 4:
+        if event_type in {"tool.started", "tool.completed"}:
+            # Hermes now emits structured tool_start/tool_complete callbacks
+            # with the real tool_call.id. Ignore legacy name-keyed progress for
+            # those phases so the UI does not render duplicate tool rows.
             return {
-                "event": "tool.started",
+                "event": "status",
                 "stream_id": stream_id,
                 "run_id": stream_id,
                 "timestamp": time.time(),
-                "tool": args[1],
-                "call_id": args[1],
-                "args": args[3] if isinstance(args[3], dict) else {},
-                "preview": args[2] or "",
-            }
-        elif event_type == "tool.completed" and len(args) >= 2:
-            return {
-                "event": "tool.completed",
-                "stream_id": stream_id,
-                "run_id": stream_id,
-                "timestamp": time.time(),
-                "tool": args[1],
-                "call_id": args[1],
-                "args": {},
-                "result": "",
-                "duration": kwargs.get("duration", 0),
-                "error": kwargs.get("is_error", False),
+                "text": str(args[2] if len(args) >= 3 else event_type),
             }
         elif event_type == "_thinking" and len(args) >= 2:
             return {

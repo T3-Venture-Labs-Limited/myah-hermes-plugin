@@ -246,6 +246,10 @@ def myah_pre_llm_call(
         agent.stream_delta_callback = cbs["stream_delta"]
     if "tool_progress" in cbs:
         agent.tool_progress_callback = cbs["tool_progress"]
+    if "tool_start" in cbs:
+        agent.tool_start_callback = cbs["tool_start"]
+    if "tool_complete" in cbs:
+        agent.tool_complete_callback = cbs["tool_complete"]
     if "status" in cbs:
         agent.status_callback = cbs["status"]
     if "reasoning" in cbs and hasattr(agent, "reasoning_callback"):
