@@ -25,6 +25,8 @@ def _make_fake_agent():
     agent = SimpleNamespace(
         stream_delta_callback=lambda *a, **kw: None,
         tool_progress_callback=lambda *a, **kw: None,
+        tool_start_callback=lambda *a, **kw: None,
+        tool_complete_callback=lambda *a, **kw: None,
         status_callback=lambda *a, **kw: None,
         reasoning_callback=lambda *a, **kw: None,
     )
@@ -38,6 +40,8 @@ def _make_fake_adapter(session_key: str):
     structured = {
         "stream_delta": MagicMock(name="cb_stream_delta"),
         "tool_progress": MagicMock(name="cb_tool_progress"),
+        "tool_start": MagicMock(name="cb_tool_start"),
+        "tool_complete": MagicMock(name="cb_tool_complete"),
         "status": MagicMock(name="cb_status"),
         "reasoning": MagicMock(name="cb_reasoning"),
     }
@@ -109,6 +113,8 @@ def test_hook_installs_callbacks_and_marks_native_streaming():
     assert result is None
     assert fake_agent.stream_delta_callback is structured["stream_delta"]
     assert fake_agent.tool_progress_callback is structured["tool_progress"]
+    assert fake_agent.tool_start_callback is structured["tool_start"]
+    assert fake_agent.tool_complete_callback is structured["tool_complete"]
     assert fake_agent.status_callback is structured["status"]
     assert fake_agent.reasoning_callback is structured["reasoning"]
     assert sk in adapter._native_streaming_used
@@ -705,12 +711,12 @@ def test_push_event_sync_message_delta_marks_stream_had_content():
         loop.close()
 
 
-def test_push_event_sync_non_delta_does_not_mark_stream_had_content():
-    """Only ``message.delta`` events count as 'content'. Other events
-    (run.completed, tool.started, status, etc.) must NOT mark
-    ``_stream_had_content`` — otherwise the suppression-workaround warning
-    would never fire even on truly empty responses (those still emit
-    run.completed and other lifecycle events).
+def test_push_event_sync_visible_activity_marks_stream_had_content():
+    """Visible structured activity counts as stream content.
+
+    Tool/status/reasoning events render useful Myah timeline rows.  They must
+    suppress the generic gateway-warning fallback, while lifecycle-only events
+    such as ``run.completed`` still do not count.
     """
     adapter = _make_adapter_vanilla_safe()
 
@@ -727,6 +733,8 @@ def test_push_event_sync_non_delta_does_not_mark_stream_had_content():
             "run_id": "stream-empty",
             "timestamp": 0.0,
         })
+        assert "stream-empty" not in adapter._stream_had_content
+
         adapter._push_event_sync("stream-empty", {
             "event": "tool.started",
             "stream_id": "stream-empty",
@@ -738,13 +746,7 @@ def test_push_event_sync_non_delta_does_not_mark_stream_had_content():
             "text": "thinking...",
         })
 
-        assert "stream-empty" not in adapter._stream_had_content, (
-            "_stream_had_content must only track stream_ids that received "
-            "at least one message.delta event. Lifecycle events "
-            "(run.completed, tool.*, status) do NOT count as content — "
-            "marking the set on them would silence the suppression-bug "
-            "warning on truly empty responses."
-        )
+        assert "stream-empty" in adapter._stream_had_content
     finally:
         loop.close()
 
