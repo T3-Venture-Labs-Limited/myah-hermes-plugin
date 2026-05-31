@@ -8,6 +8,7 @@ native ``origin`` / ``deliver`` fields, preserving existing Hermes delivery.
 from __future__ import annotations
 
 import re
+from pathlib import Path as FsPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -18,7 +19,6 @@ from cron import jobs as cron_jobs
 from ._common import require_session_token
 
 router = APIRouter()
-
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 
@@ -53,6 +53,39 @@ def _validate_job_id(job_id: str) -> str:
     return job_id
 
 
+def _parse_run_file(path: FsPath) -> dict[str, Any]:
+    stem = path.stem
+    content = path.read_text(encoding="utf-8")
+    parts = stem.split("_")
+    if len(parts) == 2:
+        ran_at = f'{parts[0]}T{parts[1].replace("-", ":")}+00:00'
+    else:
+        ran_at = stem
+
+    response = ""
+    if "## Response" in content:
+        response = content.split("## Response", 1)[1].strip()
+
+    prompt = ""
+    if "## Prompt" in content:
+        raw_prompt = content.split("## Prompt", 1)[1]
+        if "##" in raw_prompt:
+            raw_prompt = raw_prompt.split("##", 1)[0]
+        prompt = re.sub(r"^\[SYSTEM:.*?\]\n+", "", raw_prompt.strip(), flags=re.DOTALL).strip()[:500]
+
+    status = "error" if "(FAILED)" in content else "ok"
+    if response.upper().startswith("[SILENT]"):
+        status = "silent"
+
+    return {
+        "id": stem,
+        "ran_at": ran_at,
+        "status": status,
+        "response": response[:2000],
+        "prompt": prompt,
+    }
+
+
 @router.post("/cron/jobs/{job_id}/myah-metadata", dependencies=[Depends(require_session_token)])
 async def patch_myah_metadata(
     body: MyahMetadataBody,
@@ -82,3 +115,24 @@ async def patch_myah_metadata(
     if not updated:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True, "job": updated}
+
+
+@router.get("/cron/jobs/{job_id}/outputs", dependencies=[Depends(require_session_token)])
+async def get_job_outputs(
+    job_id: str = Path(..., min_length=12, max_length=12),
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return parsed cron output files for platform-side adoption backfill."""
+    job_id = _validate_job_id(job_id)
+    safe_limit = max(0, min(int(limit or 50), 500))
+    output_dir = cron_jobs.OUTPUT_DIR / job_id
+    if not output_dir.exists():
+        return {"runs": []}
+
+    runs: list[dict[str, Any]] = []
+    for output_file in sorted(output_dir.glob("*.md"), reverse=True)[:safe_limit]:
+        try:
+            runs.append(_parse_run_file(output_file))
+        except Exception:
+            continue
+    return {"runs": runs}
