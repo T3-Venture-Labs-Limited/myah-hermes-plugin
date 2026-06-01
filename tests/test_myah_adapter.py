@@ -13,8 +13,9 @@ Tests cover:
 import asyncio
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp.test_utils import make_mocked_request
 from gateway.config import Platform, PlatformConfig
 
 
@@ -172,6 +173,94 @@ class TestDualMapping:
 
         assert len(adapter._streams) == 3
         assert adapter._chat_id_streams["chat-0"] != adapter._chat_id_streams["chat-1"]
+
+
+# ── /myah/v1/message source metadata ───────────────────────────────────────
+
+class TestMessageEndpointSourceMetadata:
+    @pytest.mark.asyncio
+    async def test_platform_message_id_is_carried_on_session_source(self):
+        """Myah's DB message id must reach SessionSource for Langfuse correlation.
+
+        MessageEvent.message_id remains the internal stream/run id; the Myah
+        platform message id belongs on event.source.message_id so Hermes session
+        context exposes it as HERMES_SESSION_MESSAGE_ID.
+        """
+        adapter = _make_adapter(auth_key="source-meta-secret")
+        captured = {}
+
+        async def _capture_dispatch(event, stream_id, chat_id, session_key):
+            captured["event"] = event
+            captured["stream_id"] = stream_id
+            captured["chat_id"] = chat_id
+            captured["session_key"] = session_key
+
+        adapter._dispatch_message = _capture_dispatch
+        request = make_mocked_request(
+            "POST",
+            "/myah/v1/message",
+            headers={"Authorization": "Bearer source-meta-secret"},
+        )
+        request.json = AsyncMock(return_value={
+            "message": "hello",
+            "session_id": "chat-uuid-1",
+            "user_id": "user-uuid-1",
+            "user_name": "Test User",
+            "chat_name": "Debug Chat",
+            "message_id": "message-uuid-1",
+        })
+
+        resp = await adapter._handle_message_endpoint(request)
+        await asyncio.sleep(0)
+
+        assert resp.status == 202
+        event = captured["event"]
+        assert event.source.chat_id == "chat-uuid-1"
+        assert event.source.user_id == "user-uuid-1"
+        assert event.source.message_id == "message-uuid-1"
+        assert event.message_id == captured["stream_id"]
+        assert event.message_id.startswith("myah_")
+
+    @pytest.mark.asyncio
+    async def test_platform_message_id_drops_non_id_like_values(self):
+        """Only opaque ID-like values should enter SessionSource metadata.
+
+        The Myah platform owns this field, but the adapter is still a boundary:
+        reject values shaped like emails, paths, names, or arbitrary text before
+        Hermes session context can expose them to observability plugins.
+        """
+        adapter = _make_adapter(auth_key="source-meta-secret")
+        captured = {}
+
+        async def _capture_dispatch(event, stream_id, chat_id, session_key):
+            captured["event"] = event
+            captured["stream_id"] = stream_id
+            captured["chat_id"] = chat_id
+            captured["session_key"] = session_key
+
+        adapter._dispatch_message = _capture_dispatch
+        request = make_mocked_request(
+            "POST",
+            "/myah/v1/message",
+            headers={"Authorization": "Bearer source-meta-secret"},
+        )
+        request.json = AsyncMock(return_value={
+            "message": "hello",
+            "session_id": "chat-uuid-1",
+            "user_id": "user-uuid-1",
+            "message_id": "person@example.com /tmp/provider-key.txt",
+        })
+
+        resp = await adapter._handle_message_endpoint(request)
+        await asyncio.sleep(0)
+
+        assert resp.status == 202
+        event = captured["event"]
+        assert event.source.message_id is None
+        assert event.message_id == captured["stream_id"]
+        assert captured["chat_id"] == "chat-uuid-1"
+        assert captured["session_key"].endswith(":chat-uuid-1")
+        assert "person@example.com" not in captured["session_key"]
 
 
 # ── _format_tool_event ──────────────────────────────────────────────────────
