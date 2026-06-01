@@ -29,6 +29,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -149,6 +150,19 @@ def _recover_cron_job_id_from_session_key() -> str:
     # check so we don't mis-classify a malformed key.
     if not candidate or not all(c in '0123456789abcdef' for c in candidate):
         return ''
+    return candidate
+
+
+_ID_LIKE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _clean_observability_id(value: str) -> Optional[str]:
+    """Return an opaque ID-like value, or None for sensitive/free-form text."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    if not _ID_LIKE_VALUE_RE.fullmatch(candidate):
+        return None
     return candidate
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -618,7 +632,7 @@ class MyahAdapter(BasePlatformAdapter):
         user_name = body.get("user_name")
         user_id = body.get("user_id")
         chat_name = body.get("chat_name")
-        message_id = (body.get("message_id") or "").strip()
+        message_id = _clean_observability_id(str(body.get("message_id") or ""))
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
         # If the client supplies a 'model' field, apply it via
@@ -649,6 +663,7 @@ class MyahAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=user_id,
             user_name=user_name,
+            message_id=message_id or None,
         )
 
         # Compute the full session key the same way the gateway does
