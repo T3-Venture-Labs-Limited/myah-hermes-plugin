@@ -938,6 +938,63 @@ class MyahAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    def _coerce_positive_float(self, value: Any) -> Optional[float]:
+        """Return value as a positive float, or None when unset/invalid."""
+        if value is None:
+            return None
+        try:
+            parsed = float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    def _get_long_run_status_interval_seconds(self) -> float:
+        """Diagnostic interval for long dispatch waits; never a completion cap."""
+        extra = self.config.extra or {}
+        candidates = (
+            extra.get("long_run_status_interval"),
+            _myah_os.environ.get("MYAH_LONG_RUN_STATUS_INTERVAL"),
+            extra.get("gateway_timeout"),
+            extra.get("agent_gateway_timeout"),
+            _myah_os.environ.get("HERMES_AGENT_TIMEOUT"),
+        )
+        for candidate in candidates:
+            parsed = self._coerce_positive_float(candidate)
+            if parsed is not None:
+                return parsed
+        return 1800.0
+
+    async def _wait_for_session_completion(self, *, session_key: str, stream_id: str) -> None:
+        """Wait until the gateway removes ``session_key`` from active sessions.
+
+        The diagnostic interval only controls rate-limited logging. It must not
+        terminate the stream or cause ``run.completed`` while Hermes is still
+        running.
+        """
+        # ``handle_message`` schedules background work; give it a few
+        # event-loop turns to publish ``_active_sessions`` before deciding
+        # there is nothing to wait for. This is a grace window, not a runtime
+        # cap; once active, the loop below waits until Hermes really clears it.
+        for _ in range(3):
+            if session_key in self._active_sessions:
+                break
+            await asyncio.sleep(0)
+        interval = self._get_long_run_status_interval_seconds()
+        next_log_at = time.monotonic() + interval
+        while session_key in self._active_sessions:
+            now = time.monotonic()
+            if now >= next_log_at:
+                logger.info(
+                    "[myah] dispatch still running session=%s stream=%s active_for>=%.0fs",
+                    session_key,
+                    stream_id,
+                    interval,
+                )
+                next_log_at = now + interval
+            await asyncio.sleep(0.1)
+
     async def _dispatch_message(
         self,
         event: MessageEvent,
@@ -951,6 +1008,8 @@ class MyahAdapter(BasePlatformAdapter):
         None if the adapter already sent it via send()).  We emit a
         run.completed event when done, or run.failed on error.
         """
+        terminal_event_sent = False
+        cancelled = False
         try:
             if not self._message_handler:
                 self._push_event_sync(stream_id, {
@@ -960,6 +1019,7 @@ class MyahAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "error": "No message handler registered (gateway not ready)",
                 })
+                terminal_event_sent = True
                 return
 
             # The gateway's handle_message() calls _process_message_background
@@ -987,11 +1047,11 @@ class MyahAdapter(BasePlatformAdapter):
                 group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
-            for _ in range(6000):  # Up to 10 minutes (100ms intervals)
-                if _sk not in self._active_sessions:
-                    break
-                await asyncio.sleep(0.1)
+            await self._wait_for_session_completion(session_key=_sk, stream_id=stream_id)
 
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
             logger.exception("[myah] dispatch failed for stream %s", stream_id)
             self._push_event_sync(stream_id, {
@@ -1001,13 +1061,13 @@ class MyahAdapter(BasePlatformAdapter):
                 "timestamp": time.time(),
                 "error": str(exc),
             })
+            terminal_event_sent = True
         finally:
             # Emit run.completed if no explicit failure was sent
             q = self._streams.get(stream_id)
-            if q is not None:
-                # Check if run.completed or run.failed was already emitted
-                # by looking at stream state.  If the queue still exists and
-                # we haven't sent a terminal event, send run.completed now.
+            if q is not None and not terminal_event_sent and not cancelled:
+                # The queue still exists and the background session has ended;
+                # only now is it safe to send the successful terminal event.
 
                 # ── Myah: per-message model attribution (T3-932) ──
                 # Read the cached agent's model + provider so the
@@ -1094,6 +1154,13 @@ class MyahAdapter(BasePlatformAdapter):
                     q.put_nowait(None)
                 except asyncio.QueueFull:
                     pass
+            elif q is not None and terminal_event_sent and not cancelled:
+                # Failure is already terminal; close the SSE stream without
+                # incorrectly emitting a successful run.completed event.
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
             # Unblock any pending secret capture (let callback thread handle cleanup)
             pending_secret = self._pending_secrets.get(stream_id)
@@ -1125,6 +1192,13 @@ class MyahAdapter(BasePlatformAdapter):
                     "[myah] deferring _stream_sessions cleanup for session=%s "
                     "stream=%s (approval pending)",
                     session_key, stream_id,
+                )
+            elif cancelled and session_key in self._active_sessions:
+                logger.info(
+                    "[myah] preserving stream mappings for cancelled dispatch "
+                    "with active session=%s stream=%s",
+                    session_key,
+                    stream_id,
                 )
             else:
                 # Clean up dual mappings (Fix 1)
@@ -1866,44 +1940,49 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── Orphaned stream sweeper ─────────────────────────────────────────
 
+    def _sweep_orphaned_streams_once(self, *, now: Optional[float] = None) -> None:
+        """Clean up stale orphaned streams, skipping active gateway sessions."""
+        current_time = time.time() if now is None else now
+        stale = [
+            sid
+            for sid, created_at in list(self._streams_created.items())
+            if current_time - created_at > _STREAM_TTL
+            and self._stream_sessions.get(sid) not in self._active_sessions
+        ]
+        for sid in stale:
+            logger.debug("[myah] sweeping orphaned stream %s", sid)
+            q = self._streams.pop(sid, None)
+            self._streams_created.pop(sid, None)
+            # Also clean up any lingering mappings
+            session_key = self._stream_sessions.pop(sid, None)
+            if session_key:
+                self._session_streams.pop(session_key, None)
+                try:
+                    from myah_hermes_plugin.dispatcher import unregister_gateway_notify
+                    unregister_gateway_notify(session_key)
+                except Exception:
+                    pass
+            # Remove reverse chat_id mapping
+            stale_chat_ids = [
+                cid for cid, s in self._chat_id_streams.items() if s == sid
+            ]
+            for cid in stale_chat_ids:
+                self._chat_id_streams.pop(cid, None)
+                # Keep _chat_id_message_ids for the durable final-message
+                # fallback; stale-stream sweeping can race with gateway
+                # final adapter.send(...) on long/non-streaming turns.
+            # Close the queue if anyone is listening
+            if q is not None:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+
     async def _sweep_orphaned_streams(self) -> None:
         """Periodically clean up streams that were never consumed."""
         while True:
             await asyncio.sleep(60)
-            now = time.time()
-            stale = [
-                sid
-                for sid, created_at in list(self._streams_created.items())
-                if now - created_at > _STREAM_TTL
-            ]
-            for sid in stale:
-                logger.debug("[myah] sweeping orphaned stream %s", sid)
-                q = self._streams.pop(sid, None)
-                self._streams_created.pop(sid, None)
-                # Also clean up any lingering mappings
-                session_key = self._stream_sessions.pop(sid, None)
-                if session_key:
-                    self._session_streams.pop(session_key, None)
-                    try:
-                        from myah_hermes_plugin.dispatcher import unregister_gateway_notify
-                        unregister_gateway_notify(session_key)
-                    except Exception:
-                        pass
-                # Remove reverse chat_id mapping
-                stale_chat_ids = [
-                    cid for cid, s in self._chat_id_streams.items() if s == sid
-                ]
-                for cid in stale_chat_ids:
-                    self._chat_id_streams.pop(cid, None)
-                    # Keep _chat_id_message_ids for the durable final-message
-                    # fallback; stale-stream sweeping can race with gateway
-                    # final adapter.send(...) on long/non-streaming turns.
-                # Close the queue if anyone is listening
-                if q is not None:
-                    try:
-                        q.put_nowait(None)
-                    except Exception:
-                        pass
+            self._sweep_orphaned_streams_once()
 
     # ── BasePlatformAdapter interface ───────────────────────────────────
 
