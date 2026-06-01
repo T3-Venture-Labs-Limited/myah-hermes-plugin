@@ -13,7 +13,8 @@ Tests cover:
 import asyncio
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp.test_utils import make_mocked_request
 from gateway.config import Platform, PlatformConfig
@@ -771,6 +772,17 @@ class TestStreamHadContent:
             adapter._push_event_sync(stream_id, {"event": ev_type, "ts": 0})
             assert stream_id in adapter._stream_had_content, ev_type
 
+    def test_threadsafe_push_marks_stream_had_content_for_interactive_events(self):
+        """Interactive events emitted from worker threads count as visible content."""
+        adapter = _make_adapter()
+        stream_id = "s-test-interactive-threadsafe"
+        adapter._streams[stream_id] = asyncio.Queue()
+        adapter._loop = asyncio.get_event_loop()
+
+        adapter._push_event(stream_id, {"event": "clarify.required", "ts": 0})
+
+        assert stream_id in adapter._stream_had_content
+
     def test_unknown_stream_id_does_not_explode(self):
         """If the stream_id is unknown (queue not present), _push_event_sync
         must early-return without raising and without adding to the
@@ -793,6 +805,39 @@ class TestStreamHadContent:
             })
         # set behavior — only one entry per stream_id
         assert adapter._stream_had_content == {stream_id}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_message_emits_timeout_for_unanswered_clarify_before_run_completed():
+    """Unanswered clarify prompts must be closed before the terminal run event."""
+    adapter = _make_adapter()
+    stream_id = "stream-timeout-clarify"
+    session_key = "agent:main:myah:dm:session:user"
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat-1"))
+    adapter._streams[stream_id] = asyncio.Queue()
+    adapter._message_handler = AsyncMock()
+
+    with (
+        patch.object(adapter, "handle_message", new=AsyncMock()),
+        patch.object(adapter, "_wait_for_session_completion", new=AsyncMock()),
+        patch("gateway.session.build_session_key", return_value=session_key),
+        patch("myah_hermes_plugin.myah_platform.adapter.get_cached_agent_attribution_direct", return_value=None),
+        patch("myah_hermes_plugin.myah_platform.adapter.get_session_override_direct", return_value={}),
+        patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve,
+    ):
+        adapter._pending_clarifies[stream_id] = {"clarify-123": {"session_key": session_key}}
+        await adapter._dispatch_message(event, stream_id, "chat-1", session_key)
+
+    queued = []
+    while not adapter._streams[stream_id].empty():
+        queued.append(adapter._streams[stream_id].get_nowait())
+
+    resolve.assert_called_once_with("clarify-123", "")
+    assert queued[0]["event"] == "clarify.resolved"
+    assert queued[0]["status"] == "timeout"
+    assert queued[0]["clarify_id"] == "clarify-123"
+    assert queued[1]["event"] == "run.completed"
+    assert stream_id not in adapter._pending_clarifies
 
 
 # ── Streaming-callback content tracking (gateway-suppression false-positive) ─

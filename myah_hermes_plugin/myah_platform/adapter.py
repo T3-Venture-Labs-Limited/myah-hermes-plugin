@@ -315,6 +315,10 @@ class MyahAdapter(BasePlatformAdapter):
         "tool.started",
         "tool.completed",
         "tool.confirmation_required",
+        "clarify.required",
+        "clarify.resolved",
+        "secret.required",
+        "secret.resolved",
         "reasoning.delta",
         "reasoning.available",
         "status",
@@ -554,6 +558,8 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        if event.get("event") in self.CONTENTFUL_STREAM_EVENTS:
+            self._stream_had_content.add(stream_id)
         try:
             self._loop.call_soon_threadsafe(q.put_nowait, event)
         except RuntimeError:
@@ -1068,6 +1074,27 @@ class MyahAdapter(BasePlatformAdapter):
             })
             terminal_event_sent = True
         finally:
+            pending_clarifies = list((self._pending_clarifies.pop(stream_id, {}) or {}).keys())
+            if pending_clarifies:
+                try:
+                    from tools.clarify_gateway import resolve_gateway_clarify
+                    for clarify_id in pending_clarifies:
+                        resolve_gateway_clarify(clarify_id, '')
+                        self._push_event_sync(stream_id, {
+                            'event': 'clarify.resolved',
+                            'stream_id': stream_id,
+                            'run_id': stream_id,
+                            'timestamp': time.time(),
+                            'clarify_id': clarify_id,
+                            'status': 'timeout',
+                        })
+                except Exception:
+                    logger.debug(
+                        '[myah] Failed to clear pending clarifies for stream %s',
+                        stream_id,
+                        exc_info=True,
+                    )
+
             # Emit run.completed if no explicit failure was sent
             q = self._streams.get(stream_id)
             if q is not None and not terminal_event_sent and not cancelled:
@@ -1171,18 +1198,6 @@ class MyahAdapter(BasePlatformAdapter):
             pending_secret = self._pending_secrets.get(stream_id)
             if pending_secret:
                 pending_secret['event'].set()
-            pending_clarifies = list((self._pending_clarifies.pop(stream_id, {}) or {}).keys())
-            if pending_clarifies:
-                try:
-                    from tools.clarify_gateway import resolve_gateway_clarify
-                    for clarify_id in pending_clarifies:
-                        resolve_gateway_clarify(clarify_id, '')
-                except Exception:
-                    logger.debug(
-                        '[myah] Failed to clear pending clarifies for stream %s',
-                        stream_id,
-                        exc_info=True,
-                    )
 
             # ── Deferred cleanup when approvals pending (Phase 1 PR 1 §1.3) ──
             # If an action confirmation (e.g. plugin cronjob approval)
