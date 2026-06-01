@@ -83,7 +83,7 @@ async def _run_dispatch(adapter, *, chat_id: str, session_key: str, stream_id: s
 def _message_event(chat_id: str):
     msg_event = MagicMock()
     msg_event.source = MagicMock()
-    msg_event.source.platform = Platform.MYAH
+    msg_event.source.platform = Platform.LOCAL
     msg_event.source.chat_type = "dm"
     msg_event.source.chat_id = chat_id
     msg_event.source.thread_id = None
