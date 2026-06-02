@@ -315,6 +315,10 @@ class MyahAdapter(BasePlatformAdapter):
         "tool.started",
         "tool.completed",
         "tool.confirmation_required",
+        "clarify.required",
+        "clarify.resolved",
+        "secret.required",
+        "secret.resolved",
         "reasoning.delta",
         "reasoning.available",
         "status",
@@ -387,6 +391,11 @@ class MyahAdapter(BasePlatformAdapter):
 
         # Pending secret captures: stream_id → { event: threading.Event, result: dict }
         self._pending_secrets: Dict[str, Dict] = {}
+        # Pending clarify prompts: stream_id → clarify_id → metadata. The
+        # blocking primitive lives in upstream tools.clarify_gateway; this map
+        # lets the HTTP endpoint validate stream/request ownership before
+        # resolving the upstream waiting Event.
+        self._pending_clarifies: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         # ── Thread safety (Fix 2) ──────────────────────────────────────
         # Captured in connect() so callbacks from the agent worker thread
@@ -549,6 +558,8 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        if event.get("event") in self.CONTENTFUL_STREAM_EVENTS:
+            self._stream_had_content.add(stream_id)
         try:
             self._loop.call_soon_threadsafe(q.put_nowait, event)
         except RuntimeError:
@@ -1063,6 +1074,27 @@ class MyahAdapter(BasePlatformAdapter):
             })
             terminal_event_sent = True
         finally:
+            pending_clarifies = list((self._pending_clarifies.pop(stream_id, {}) or {}).keys())
+            if pending_clarifies:
+                try:
+                    from tools.clarify_gateway import resolve_gateway_clarify
+                    for clarify_id in pending_clarifies:
+                        resolve_gateway_clarify(clarify_id, '')
+                        self._push_event_sync(stream_id, {
+                            'event': 'clarify.resolved',
+                            'stream_id': stream_id,
+                            'run_id': stream_id,
+                            'timestamp': time.time(),
+                            'clarify_id': clarify_id,
+                            'status': 'timeout',
+                        })
+                except Exception:
+                    logger.debug(
+                        '[myah] Failed to clear pending clarifies for stream %s',
+                        stream_id,
+                        exc_info=True,
+                    )
+
             # Emit run.completed if no explicit failure was sent
             q = self._streams.get(stream_id)
             if q is not None and not terminal_event_sent and not cancelled:
@@ -1366,6 +1398,96 @@ class MyahAdapter(BasePlatformAdapter):
 
         return web.json_response({"ok": True, "resolved": resolved})
 
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a Hermes clarify request as a structured Myah SSE event."""
+        stream_id = self._session_streams.get(session_key) or self._chat_id_streams.get(str(chat_id))
+        if not stream_id:
+            return SendResult(success=False, error=f"No active stream for clarify session={session_key}")
+
+        self._pending_clarifies.setdefault(stream_id, {})[clarify_id] = {
+            'session_key': session_key,
+            'question': question,
+            'choices': list(choices) if choices else None,
+            'created_at': time.time(),
+        }
+        self._push_event(stream_id, {
+            'event': 'clarify.required',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'clarify_id': clarify_id,
+            'question': question,
+            'choices': list(choices) if choices else None,
+        })
+        return SendResult(success=True)
+
+    async def _handle_clarify_endpoint(self, request: "web.Request") -> "web.Response":
+        """POST /myah/v1/clarify/{stream_id} — resolve a pending clarify prompt."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        stream_id = request.match_info["stream_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        clarify_id = str(body.get('clarify_id') or '')
+        response = str(body.get('response') or '').strip()
+        if not clarify_id:
+            return web.json_response({'error': 'clarify_id is required'}, status=400)
+        if not response:
+            return web.json_response({'error': 'response is required'}, status=400)
+        if len(response) > 4096:
+            return web.json_response({'error': 'response too long'}, status=400)
+
+        pending_for_stream = self._pending_clarifies.get(stream_id) or {}
+        if clarify_id not in pending_for_stream:
+            return web.json_response(
+                {'error': 'No pending clarify request for this stream'},
+                status=404,
+            )
+
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            ok = resolve_gateway_clarify(clarify_id, response)
+        except Exception as exc:
+            logger.error('[myah] Failed to resolve clarify %s: %s', clarify_id, exc)
+            return web.json_response({'error': f'Failed to resolve clarify: {exc}'}, status=500)
+
+        if not ok:
+            pending_for_stream.pop(clarify_id, None)
+            if not pending_for_stream:
+                self._pending_clarifies.pop(stream_id, None)
+            return web.json_response(
+                {'error': 'No pending clarify request for this stream'},
+                status=404,
+            )
+
+        pending_for_stream.pop(clarify_id, None)
+        if not pending_for_stream:
+            self._pending_clarifies.pop(stream_id, None)
+        self._push_event(stream_id, {
+            'event': 'clarify.resolved',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'clarify_id': clarify_id,
+            'status': 'answered',
+            'response': response,
+        })
+        return web.json_response({'ok': True, 'resolved': 1})
+
     def _secret_capture_callback(
         self, var_name: str, prompt: str, metadata=None, stream_id: str = '',
     ) -> dict:
@@ -1435,7 +1557,7 @@ class MyahAdapter(BasePlatformAdapter):
             'run_id': stream_id,
             'timestamp': time.time(),
             'var_name': var_name,
-            'status': 'stored',
+            'status': 'cancelled' if result.get('cancelled') else 'stored',
         })
 
         return result
@@ -1460,6 +1582,23 @@ class MyahAdapter(BasePlatformAdapter):
 
         var_name = body.get('var_name', '')
         value = body.get('value', '')
+        cancel = bool(body.get('cancel', False))
+
+        if cancel:
+            if var_name != pending['var_name']:
+                return web.json_response(
+                    {'error': f"var_name mismatch: expected {pending['var_name']}"}, status=400
+                )
+            pending['result'] = {
+                'success': True,
+                'skipped': True,
+                'stored_as': var_name,
+                'validated': False,
+                'message': 'Secret entry cancelled.',
+                'cancelled': True,
+            }
+            pending['event'].set()
+            return web.json_response({'ok': True, 'cancelled': True, 'stored_as': var_name})
 
         if not value:
             return web.json_response({'error': 'value is required'}, status=400)
@@ -2139,6 +2278,7 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_post("/myah/v1/message", self._handle_message_endpoint)
         app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
+        app.router.add_post("/myah/v1/clarify/{stream_id}", self._handle_clarify_endpoint)
         app.router.add_post("/myah/v1/secret/{stream_id}", self._handle_secret_endpoint)
         app.router.add_get("/myah/v1/media", self._handle_media_get)  # Myah: media endpoint
         # ── Myah: aux router HTTP wrapper ────────────────────────────────
