@@ -2129,14 +2129,18 @@ class MyahAdapter(BasePlatformAdapter):
     def _myah_allowed_media_roots(self) -> 'list[_myah_Path]':
         """Return the list of allowed media-streaming roots.
 
-        Derived from THREE sources:
+        Derived from FIVE sources:
           1. Hardcoded Hermes cache directories (always included for back-compat).
-          2. Hermes' configured terminal.cwd from config.yaml. This is where
+          2. Default artifact roots used by hosted/OSS agent runs: /tmp, /data,
+             /workspace, and /root.
+          3. Hermes' configured terminal.cwd from config.yaml. This is where
              the agent's bash/execute_code tools land by default. For hosted
              Myah this is /root (Hermes' Docker default). For OSS-Myah this is
              whatever the user configured (e.g. ~/workspace).
-          3. Optional MYAH_MEDIA_ALLOWED_ROOTS env var (colon-separated paths)
-             for explicit additions beyond terminal.cwd.
+          4. TERMINAL_CWD / MESSAGING_CWD env bridges for the effective tool
+             runner cwd when terminal.cwd is relative.
+          5. Optional MYAH_MEDIA_ALLOWED_ROOTS env var (colon-separated paths)
+             for explicit additions beyond the defaults.
 
         Each root is resolved (symlinks followed, strict=False so non-existent
         paths don't raise) so the subpath check in _handle_media_get is
@@ -2156,6 +2160,18 @@ class MyahAdapter(BasePlatformAdapter):
             get_hermes_dir('cache/audio', 'audio_cache').resolve(),
             get_hermes_dir('cache/documents', 'document_cache').resolve(),
             get_hermes_dir('cache/screenshots', 'browser_screenshots').resolve(),
+            # ────────────────────────────────────────────────────────────────
+            # ── Myah: default artifact roots (OSS + hosted parity) ──────────
+            # Hosted per-user containers inject MYAH_MEDIA_ALLOWED_ROOTS with
+            # /data:/tmp:/workspace. Public OSS/local-Hermes installs may not
+            # have that container env injection, but Hermes tools still commonly
+            # write generated artifacts to these paths (and /root in Docker).
+            # Keep these defaults in the adapter itself so MEDIA:/tmp/foo.mp4
+            # works the same way in OSS as it does in hosted production.
+            _myah_Path('/tmp').resolve(strict=False),
+            _myah_Path('/data').resolve(strict=False),
+            _myah_Path('/workspace').resolve(strict=False),
+            _myah_Path('/root').resolve(strict=False),
             # ────────────────────────────────────────────────────────────────
         ]
 
@@ -2181,6 +2197,23 @@ class MyahAdapter(BasePlatformAdapter):
         except ImportError:
             # hermes_cli.config not importable in this context — fall back to env var only.
             pass
+
+        # The gateway/tool runner bridges the *effective* cwd into env vars.
+        # This matters when config has terminal.cwd='.' — resolving '.' inside
+        # the adapter process can point at the plugin install dir, while the
+        # agent's file tools actually used TERMINAL_CWD / MESSAGING_CWD.
+        for _myah_cwd_env in ('TERMINAL_CWD', 'MESSAGING_CWD'):
+            _myah_cwd = _myah_os_mod.environ.get(_myah_cwd_env, '').strip()
+            if not _myah_cwd:
+                continue
+            try:
+                roots.append(_myah_Path(_myah_cwd).expanduser().resolve(strict=False))
+            except (OSError, ValueError):
+                logger.warning(
+                    'Skipping unresolvable %s in allowed media roots: %r',
+                    _myah_cwd_env,
+                    _myah_cwd,
+                )
 
         _myah_extra_roots = _myah_os_mod.environ.get('MYAH_MEDIA_ALLOWED_ROOTS', '')
         for _myah_extra in _myah_extra_roots.split(':'):
