@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -99,6 +100,59 @@ def _built_session_key(adapter, msg_event) -> str:
         msg_event.source,
         group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
         thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_registers_secrets_tool_callback_for_active_stream(monkeypatch):
+    """secrets.request inside a Myah chat turn must render an inline secret card.
+
+    Regression for T3-1110: the plugin wired upstream skills_tool secret capture,
+    but the plugin-owned secrets tool had its own session-keyed callback registry.
+    Without registering that callback during dispatch, `secrets.request` returned
+    "Secure secret entry is not available in this surface" and the frontend never
+    received a `secret.required` card.
+    """
+    from myah_hermes_plugin.myah_tools.secrets_tool import secrets_tool
+
+    adapter = _make_adapter()
+    chat_id, session_key, stream_id = "chat-secret", "sess-secret", "stream-secret"
+    _seed_dual_mapping(adapter, chat_id=chat_id, session_key=session_key, stream_id=stream_id)
+    adapter._message_handler = MagicMock()
+
+    msg_event = _message_event(chat_id)
+
+    async def fake_handle_message(event):
+        adapter._active_sessions[session_key] = object()
+        try:
+            result = json.loads(secrets_tool({
+                "action": "request",
+                "key": "HF_TOKEN",
+                "prompt": "Please enter HF_TOKEN",
+            }))
+            assert result["success"] is True
+            assert result["skipped"] is True
+            assert result["message"] == "Secret setup timed out."
+        finally:
+            adapter._active_sessions.pop(session_key, None)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+    monkeypatch.setattr(adapter, "_wait_for_session_completion", AsyncMock(return_value=None))
+    monkeypatch.setattr(adapter, "_secret_capture_callback", MagicMock(return_value={
+        "success": True,
+        "skipped": True,
+        "stored_as": "HF_TOKEN",
+        "validated": False,
+        "message": "Secret setup timed out.",
+    }))
+
+    await adapter._dispatch_message(msg_event, stream_id, chat_id, session_key)
+
+    adapter._secret_capture_callback.assert_called_once_with(
+        "HF_TOKEN",
+        "Please enter HF_TOKEN",
+        metadata={},
+        stream_id=stream_id,
     )
 
 
