@@ -1045,7 +1045,49 @@ class MyahAdapter(BasePlatformAdapter):
             #
             # So we call handle_message() and let the base class manage
             # the lifecycle.  Our send() method pushes events to the SSE stream.
-            await self.handle_message(event)
+            #
+            # T3-1110: the plugin-owned secrets tool has its own session-keyed
+            # callback registry (separate from upstream skills_tool's global
+            # callback). Register it before handle_message() creates the actual
+            # agent task so a `secrets.request` tool call can render a Myah
+            # `secret.required` card instead of reporting that secure intake is
+            # unavailable on this surface.
+            _secret_token = None
+            _secret_callback_registered = False
+            try:
+                from myah_hermes_plugin.myah_tools.secrets_tool import (
+                    reset_secret_request_session_key,
+                    set_secret_request_session_key,
+                    set_secrets_request_callback,
+                )
+
+                def _myah_secret_request_callback(name, prompt, metadata=None):
+                    return self._secret_capture_callback(
+                        name,
+                        prompt,
+                        metadata=metadata or {},
+                        stream_id=stream_id,
+                    )
+
+                set_secrets_request_callback(session_key, _myah_secret_request_callback)
+                _secret_callback_registered = True
+                _secret_token = set_secret_request_session_key(session_key)
+            except Exception:
+                reset_secret_request_session_key = None  # type: ignore[assignment]
+                set_secrets_request_callback = None  # type: ignore[assignment]
+                logger.debug(
+                    "[myah] secrets tool callback registration unavailable for session=%s",
+                    session_key,
+                    exc_info=True,
+                )
+
+            try:
+                await self.handle_message(event)
+            finally:
+                if _secret_token is not None and reset_secret_request_session_key is not None:
+                    reset_secret_request_session_key(_secret_token)
+                if _secret_callback_registered and set_secrets_request_callback is not None:
+                    set_secrets_request_callback(session_key, None)
 
             # Wait briefly for the background processing to start and complete.
             # The base handle_message() spawns a background task — we need to
