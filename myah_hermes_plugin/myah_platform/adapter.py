@@ -2553,6 +2553,9 @@ class MyahAdapter(BasePlatformAdapter):
         ``docs/superpowers/specs/2026-04-24-cron-origin-and-approval-design.md``.
         """
         meta = dict(metadata) if metadata else {}
+        if meta.get("source_platform") == "webhook" or meta.get("webhook_delivery"):
+            return await self._send_external_run_via_webhook(chat_id, content, meta)
+
         is_cron_delivery = bool(meta.get("job_id"))
 
         # ── Cron Path A: recover job_id when scheduler didn't forward it ──
@@ -2906,6 +2909,146 @@ class MyahAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False,
                 error=f"final-message fallback error: {type(exc).__name__}: {exc}",
+            )
+
+    async def _send_external_run_via_webhook(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> SendResult:
+        """Persist a completed generic webhook-triggered run in Myah."""
+        base_url = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')
+        bearer = _myah_os.environ.get('MYAH_PLATFORM_BEARER')
+        user_id = _myah_os.environ.get('MYAH_USER_ID', '')
+        if not (base_url and bearer and user_id and chat_id):
+            return SendResult(
+                success=False,
+                error=f"external run webhook env unavailable for chat_id={chat_id}",
+            )
+
+        webhook_delivery = (
+            metadata.get('webhook_delivery')
+            if isinstance(metadata.get('webhook_delivery'), dict)
+            else {}
+        )
+        source_payload = (
+            metadata.get('webhook_payload')
+            if isinstance(metadata.get('webhook_payload'), dict)
+            else {}
+        )
+        deliver_extra = (
+            metadata.get('webhook_deliver_extra')
+            if isinstance(metadata.get('webhook_deliver_extra'), dict)
+            else {}
+        )
+        repository = (
+            source_payload.get('repository')
+            if isinstance(source_payload.get('repository'), dict)
+            else {}
+        )
+        pull_request = (
+            source_payload.get('pull_request')
+            if isinstance(source_payload.get('pull_request'), dict)
+            else {}
+        )
+
+        repo = deliver_extra.get('repo') or repository.get('full_name') or ''
+        pr_number = deliver_extra.get('pr_number') or pull_request.get('number') or ''
+        pr_title = pull_request.get('title') or ''
+        run_kind = deliver_extra.get('run_kind') or (
+            'github_pr_review' if pull_request else 'webhook'
+        )
+        route_name = webhook_delivery.get('route_name') or ''
+        delivery_id = webhook_delivery.get('delivery_id') or metadata.get('message_id') or ''
+        if not delivery_id:
+            delivery_id = f"{route_name}:{repo}:{pr_number}:{source_payload.get('action', '')}"
+
+        if deliver_extra.get('title'):
+            title = str(deliver_extra['title'])
+        elif repo and pr_number:
+            title = f"PR #{pr_number} in {repo}"
+            if pr_title:
+                title += f": {pr_title}"
+        else:
+            title = route_name or run_kind
+
+        author = ''
+        pr_user = pull_request.get('user')
+        if isinstance(pr_user, dict):
+            author = pr_user.get('login') or ''
+
+        external_metadata = {
+            'route_name': route_name,
+            'event_type': webhook_delivery.get('event_type') or '',
+            'action': source_payload.get('action') or '',
+            'repo': repo,
+            'pr_number': pr_number,
+            'pr_title': pr_title,
+            'pr_url': pull_request.get('html_url') or '',
+            'author': author,
+        }
+        payload_body = {
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'run_id': str(delivery_id),
+            'run_kind': str(run_kind),
+            'title': title,
+            'response': content,
+            'status': metadata.get('status') or 'ok',
+            'metadata': external_metadata,
+        }
+
+        url = f"{base_url.rstrip('/')}/api/v1/processes/webhook/external-run-complete"
+        headers = {'Authorization': f'Bearer {bearer}'}
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload_body, headers=headers) as resp:
+                    body_text = ''
+                    try:
+                        body_text = (await resp.text())[:200]
+                    except Exception:
+                        pass
+                    if 200 <= resp.status < 300:
+                        return SendResult(success=True, message_id=str(payload_body['run_id']))
+                    logger.warning(
+                        "Myah external run delivery failed: status=%s url=%s "
+                        "chat_id=%s body=%r",
+                        resp.status,
+                        url,
+                        chat_id,
+                        body_text,
+                    )
+                    self._maybe_breadcrumb(
+                        f"external run webhook delivery non-2xx: {resp.status}",
+                        url=url,
+                        chat_id=chat_id,
+                        status=resp.status,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"external run webhook returned HTTP {resp.status}",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Myah external run delivery raised %s: %s (url=%s chat_id=%s)",
+                type(exc).__name__,
+                exc,
+                url,
+                chat_id,
+            )
+            self._maybe_breadcrumb(
+                f"external run webhook delivery exception: {type(exc).__name__}",
+                url=url,
+                chat_id=chat_id,
+                error=str(exc)[:200],
+            )
+            return SendResult(
+                success=False,
+                error=f"external run webhook error: {type(exc).__name__}: {exc}",
             )
 
     # ── Myah: Bug D v3 — webhook delivery helper ────────────

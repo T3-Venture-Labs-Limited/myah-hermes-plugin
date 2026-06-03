@@ -47,6 +47,7 @@ Modules:
 from . import cron_watcher  # noqa: F401
 from . import mcp_disconnect  # noqa: F401  (re-exported as `from runtime_extensions import mcp_disconnect`)
 from . import streaming_callbacks  # noqa: F401
+from . import webhook_metadata  # noqa: F401
 
 
-__all__ = ["cron_watcher", "mcp_disconnect", "streaming_callbacks"]
+__all__ = ["cron_watcher", "mcp_disconnect", "streaming_callbacks", "webhook_metadata"]

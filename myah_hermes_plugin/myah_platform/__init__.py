@@ -311,6 +311,14 @@ def register(ctx: Any) -> None:
         register_streaming_hook(ctx)
     except Exception:
         log.exception("Failed to register Phase F streaming hook")
+    try:
+        from myah_hermes_plugin.runtime_extensions.webhook_metadata import (
+            install as install_webhook_metadata_forwarding,
+        )
+
+        install_webhook_metadata_forwarding()
+    except Exception:
+        log.exception("Failed to install webhook metadata forwarding")
     # ───────────────────────────────────────────────────────────────
 
     # ── Secret-capture global callback (Phase 5.1 — F4 vanilla support) ─
