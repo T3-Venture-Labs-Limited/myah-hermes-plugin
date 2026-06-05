@@ -114,6 +114,7 @@ from . import (
     _sessions_and_lifecycle,
     _skills_plugins_mcp,
     _soul_and_config,
+    _wiki,
 )
 from ..myah_hook import register_sentry_hook
 
@@ -146,3 +147,4 @@ router.include_router(_providers.router)
 router.include_router(_sessions_and_lifecycle.router)
 router.include_router(_env.router)
 router.include_router(_cron_jobs.router)
+router.include_router(_wiki.router)

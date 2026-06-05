@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 from myah_hermes_plugin.myah_admin.dashboard import _providers as _providers_module
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 def providers_mod() -> types.ModuleType:
     """The migrated _providers module (clean package member)."""
     return _providers_module
@@ -112,10 +112,87 @@ def test_list_providers_against_real_catalog(client):
     body = resp.json()
 
     expected = {
-        slug for slug, override in MYAH_OVERRIDES.items()
-        if override.get("v1_visible")
+        slug for slug, override in MYAH_OVERRIDES.items() if override.get("v1_visible")
     }
     assert set(body.keys()) == expected
+
+
+def test_build_catalog_fetches_models_dev_once_for_capabilities(
+    providers_mod, monkeypatch
+):
+    """Catalog enrichment must not retry the models.dev fetch per model.
+
+    When network fetch falls back to the short-lived disk cache, calling
+    agent.models_dev.get_model_capabilities for every curated model can spend
+    15s+ rebuilding the provider catalog and trip the platform dashboard
+    timeout. The plugin should fetch the models.dev snapshot once per catalog
+    build and derive capabilities from that snapshot.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import agent.models_dev as models_dev
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.models as hermes_models
+    import hermes_cli.providers as hermes_providers
+    from myah_hermes_plugin.myah_admin import myah_overrides
+
+    monkeypatch.setattr(
+        hermes_models,
+        "CANONICAL_PROVIDERS",
+        [
+            SimpleNamespace(slug="alpha", label="Alpha", tui_desc="Alpha provider"),
+            SimpleNamespace(slug="beta", label="Beta", tui_desc="Beta provider"),
+        ],
+    )
+    monkeypatch.setattr(
+        hermes_models,
+        "_PROVIDER_MODELS",
+        {"alpha": ["alpha-fast", "alpha-reasoning"], "beta": ["beta-vision"]},
+    )
+    monkeypatch.setattr(auth_mod, "PROVIDER_REGISTRY", {})
+    monkeypatch.setattr(hermes_providers, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(myah_overrides, "MYAH_OVERRIDES", {})
+    monkeypatch.setattr(
+        models_dev,
+        "PROVIDER_TO_MODELS_DEV",
+        {"alpha": "alpha-dev", "beta": "beta-dev"},
+    )
+
+    fetch_calls = []
+
+    def fake_fetch_models_dev(force_refresh=False):
+        fetch_calls.append(force_refresh)
+        return {
+            "alpha-dev": {
+                "models": {
+                    "alpha-fast": {
+                        "tool_call": True,
+                        "limit": {"context": 1234, "output": 99},
+                    },
+                    "alpha-reasoning": {"reasoning": True, "family": "alpha-family"},
+                }
+            },
+            "beta-dev": {
+                "models": {
+                    "beta-vision": {"modalities": {"input": ["text", "image"]}},
+                }
+            },
+        }
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", fake_fetch_models_dev)
+
+    catalog = asyncio.run(providers_mod._build_catalog())
+
+    assert fetch_calls == [False]
+    alpha_fast = catalog["alpha"]["curated_models"][0]
+    alpha_reasoning = catalog["alpha"]["curated_models"][1]
+    beta_vision = catalog["beta"]["curated_models"][0]
+    assert alpha_fast["capabilities"]["supports_tools"] is True
+    assert alpha_fast["capabilities"]["context_window"] == 1234
+    assert alpha_reasoning["capabilities"]["supports_reasoning"] is True
+    assert alpha_reasoning["capabilities"]["model_family"] == "alpha-family"
+    assert beta_vision["capabilities"]["supports_vision"] is True
 
 
 # ── GET /providers/{id}/models ──────────────────────────────────────────────
@@ -130,8 +207,10 @@ def test_provider_models_returns_id_name_pairs(client, providers_mod):
         return fake_catalog
 
     fake_ids = ["model-a", "model-b"]
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch("hermes_cli.models.provider_model_ids", return_value=fake_ids):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch("hermes_cli.models.provider_model_ids", return_value=fake_ids),
+    ):
         resp = client.get("/providers/openrouter/models")
 
     assert resp.status_code == 200
@@ -154,14 +233,17 @@ def test_provider_models_unknown_provider_returns_404(client, providers_mod):
 
 def test_provider_models_lookup_failure_returns_502(client, providers_mod):
     """If provider_model_ids raises, return 502 with the error message."""
+
     async def _fake_build():
         return {"openrouter": {"id": "openrouter"}}
 
     def _broken(_):
         raise RuntimeError("upstream unreachable")
 
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch("hermes_cli.models.provider_model_ids", side_effect=_broken):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch("hermes_cli.models.provider_model_ids", side_effect=_broken),
+    ):
         resp = client.get("/providers/openrouter/models")
 
     assert resp.status_code == 502
@@ -177,22 +259,28 @@ def _fake_catalog_entry(write_type="env_var", env_var="OPENROUTER_API_KEY"):
             "id": "alpha",
             "write_type": write_type,
             "env_var": env_var,
-            "validation": {"url": "https://example.com/v",
-                           "method": "GET", "auth": "bearer"},
+            "validation": {
+                "url": "https://example.com/v",
+                "method": "GET",
+                "auth": "bearer",
+            },
         }
     }
 
 
 def test_connect_credential_rejects_bad_key(client, providers_mod):
     """If _validate_api_key returns (False, ...), respond 400."""
+
     async def _fake_build():
         return _fake_catalog_entry()
 
     async def _fake_validate(_entry, _key):
         return (False, "auth denied by provider (HTTP 401)")
 
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch.object(providers_mod, "_validate_api_key", _fake_validate):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch.object(providers_mod, "_validate_api_key", _fake_validate),
+    ):
         resp = client.post(
             "/providers/alpha/credential",
             json={"api_key": "bad-key"},
@@ -204,6 +292,7 @@ def test_connect_credential_rejects_bad_key(client, providers_mod):
 
 def test_connect_credential_rejects_empty_key(client, providers_mod):
     """Empty/whitespace api_key returns 400 before catalog lookup."""
+
     async def _fake_build():
         return _fake_catalog_entry()
 
@@ -232,6 +321,7 @@ def test_connect_credential_unknown_provider_returns_404(client, providers_mod):
 
 def test_connect_credential_success_writes_env_and_pool(client, providers_mod):
     """Happy path: validation accepts, env var saved, pool entry added."""
+
     async def _fake_build():
         return _fake_catalog_entry()
 
@@ -246,10 +336,12 @@ def test_connect_credential_success_writes_env_and_pool(client, providers_mod):
     def _fake_save_env(key, value):
         save_env_calls.append((key, value))
 
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch.object(providers_mod, "_validate_api_key", _fake_validate), \
-         patch("hermes_cli.config.save_env_value", _fake_save_env), \
-         patch("agent.credential_pool.load_pool", return_value=fake_pool):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch.object(providers_mod, "_validate_api_key", _fake_validate),
+        patch("hermes_cli.config.save_env_value", _fake_save_env),
+        patch("agent.credential_pool.load_pool", return_value=fake_pool),
+    ):
         resp = client.post(
             "/providers/alpha/credential",
             json={"api_key": "sk-good-key-1234", "label": "primary"},
@@ -303,12 +395,14 @@ def test_connect_credential_custom_provider_writes_config(client, providers_mod)
     def _fake_save_config(cfg):
         saved_cfgs.append(dict(cfg))
 
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch.object(providers_mod, "_validate_api_key", _fake_validate), \
-         patch("hermes_cli.config.save_env_value", lambda *_a, **_k: None), \
-         patch("hermes_cli.config.load_config", _fake_load_config), \
-         patch("hermes_cli.config.save_config", _fake_save_config), \
-         patch("agent.credential_pool.load_pool", return_value=MagicMock()):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch.object(providers_mod, "_validate_api_key", _fake_validate),
+        patch("hermes_cli.config.save_env_value", lambda *_a, **_k: None),
+        patch("hermes_cli.config.load_config", _fake_load_config),
+        patch("hermes_cli.config.save_config", _fake_save_config),
+        patch("agent.credential_pool.load_pool", return_value=MagicMock()),
+    ):
         resp = client.post(
             "/providers/openai/credential",
             json={"api_key": "sk-1234"},
@@ -325,14 +419,17 @@ def test_connect_credential_custom_provider_writes_config(client, providers_mod)
 
 def test_connect_credential_unsupported_write_type(client, providers_mod):
     """write_type=oauth_external rejects with 400 + OAuth hint."""
+
     async def _fake_build():
         return {"some-oauth": {"id": "some-oauth", "write_type": "oauth_external"}}
 
     async def _fake_validate(_entry, _key):
         return (True, "validated")
 
-    with patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch.object(providers_mod, "_validate_api_key", _fake_validate):
+    with (
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch.object(providers_mod, "_validate_api_key", _fake_validate),
+    ):
         resp = client.post(
             "/providers/some-oauth/credential",
             json={"api_key": "anything"},
@@ -396,9 +493,11 @@ def test_delete_credential_clears_env_when_pool_empty(client, providers_mod):
         removed.append(key)
         return True
 
-    with patch("agent.credential_pool.load_pool", _fake_load_pool), \
-         patch.object(providers_mod, "_build_catalog", _fake_build), \
-         patch("hermes_cli.config.remove_env_value", _fake_remove_env):
+    with (
+        patch("agent.credential_pool.load_pool", _fake_load_pool),
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+        patch("hermes_cli.config.remove_env_value", _fake_remove_env),
+    ):
         resp = client.delete("/providers/alpha/credential/myah-xyz")
 
     assert resp.status_code == 200
@@ -432,9 +531,11 @@ def test_delete_all_credentials(client, providers_mod):
     async def _fake_build():
         return {"alpha": {"env_var": "ALPHA_KEY"}}
 
-    with patch("hermes_cli.auth.clear_provider_auth", _fake_clear_auth), \
-         patch("hermes_cli.config.remove_env_value", _fake_remove_env), \
-         patch.object(providers_mod, "_build_catalog", _fake_build):
+    with (
+        patch("hermes_cli.auth.clear_provider_auth", _fake_clear_auth),
+        patch("hermes_cli.config.remove_env_value", _fake_remove_env),
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+    ):
         resp = client.delete("/providers/alpha")
 
     assert resp.status_code == 200
@@ -445,15 +546,18 @@ def test_delete_all_credentials(client, providers_mod):
 
 def test_delete_all_credentials_swallows_clear_auth_error(client, providers_mod):
     """clear_provider_auth raising must not propagate (legacy parity)."""
+
     def _broken(_):
         raise RuntimeError("auth.json corrupt")
 
     async def _fake_build():
         return {"alpha": {"env_var": "ALPHA_KEY"}}
 
-    with patch("hermes_cli.auth.clear_provider_auth", _broken), \
-         patch("hermes_cli.config.remove_env_value", lambda *_a: True), \
-         patch.object(providers_mod, "_build_catalog", _fake_build):
+    with (
+        patch("hermes_cli.auth.clear_provider_auth", _broken),
+        patch("hermes_cli.config.remove_env_value", lambda *_a: True),
+        patch.object(providers_mod, "_build_catalog", _fake_build),
+    ):
         resp = client.delete("/providers/alpha")
 
     assert resp.status_code == 200
@@ -577,9 +681,7 @@ async def test_validate_api_key_timeout_optimistic(providers_mod):
 @pytest.mark.asyncio
 async def test_validate_api_key_x_api_key_auth_style(providers_mod):
     """auth=x-api-key sets the x-api-key header + anthropic-version."""
-    entry = {
-        "validation": {"url": "https://x", "method": "GET", "auth": "x-api-key"}
-    }
+    entry = {"validation": {"url": "https://x", "method": "GET", "auth": "x-api-key"}}
 
     captured: dict = {}
 
@@ -600,9 +702,7 @@ async def test_validate_api_key_x_api_key_auth_style(providers_mod):
 @pytest.mark.asyncio
 async def test_validate_api_key_query_auth_style(providers_mod):
     """auth=query passes the key as ?key=... query param."""
-    entry = {
-        "validation": {"url": "https://x", "method": "GET", "auth": "query"}
-    }
+    entry = {"validation": {"url": "https://x", "method": "GET", "auth": "query"}}
 
     captured: dict = {}
 

@@ -54,29 +54,89 @@ class ConnectCredentialBody(BaseModel):
 # ── Catalog helpers (ported verbatim from myah_management.py) ───────────────
 
 
-def _build_model_entry(provider: str, model_id: str) -> dict:
+def _capabilities_from_models_dev_snapshot(
+    provider: str,
+    model_id: str,
+    models_dev_data: dict,
+) -> dict | None:
+    """Return capability metadata using a pre-fetched models.dev snapshot.
+
+    ``agent.models_dev.get_model_capabilities`` calls ``fetch_models_dev`` for
+    each model. When the network fetch fails and Hermes falls back to its
+    short-lived disk cache, that means one network retry per curated model and
+    a provider catalog that can exceed the platform's dashboard timeout. The
+    dashboard catalog only needs a best-effort enrichment, so fetch the snapshot
+    once in ``_build_catalog`` and derive every model's capabilities from it.
+    """
+    try:
+        from agent.models_dev import PROVIDER_TO_MODELS_DEV, _find_model_entry
+
+        mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
+        if not mdev_provider_id:
+            return None
+        provider_data = models_dev_data.get(mdev_provider_id)
+        if not isinstance(provider_data, dict):
+            return None
+        models = provider_data.get("models", {})
+        if not isinstance(models, dict):
+            return None
+        mdev_entry = _find_model_entry(models, model_id)
+        if not isinstance(mdev_entry, dict):
+            return None
+
+        input_mods = mdev_entry.get("modalities", {})
+        if isinstance(input_mods, dict):
+            input_mods = input_mods.get("input")
+        else:
+            input_mods = None
+        if isinstance(input_mods, list):
+            supports_vision = "image" in input_mods
+        else:
+            supports_vision = bool(mdev_entry.get("attachment", False))
+
+        limit = mdev_entry.get("limit", {})
+        if not isinstance(limit, dict):
+            limit = {}
+        ctx = limit.get("context")
+        out = limit.get("output")
+
+        return {
+            "supports_tools": bool(mdev_entry.get("tool_call", False)),
+            "supports_vision": supports_vision,
+            "supports_reasoning": bool(mdev_entry.get("reasoning", False)),
+            "context_window": int(ctx)
+            if isinstance(ctx, (int, float)) and ctx > 0
+            else 200000,
+            "max_output_tokens": int(out)
+            if isinstance(out, (int, float)) and out > 0
+            else 8192,
+            "model_family": mdev_entry.get("family", "") or "",
+        }
+    except Exception as exc:
+        logger.warning(
+            f"Failed to derive capabilities for {provider}/{model_id}: {exc}"
+        )
+        return None
+
+
+def _build_model_entry(
+    provider: str,
+    model_id: str,
+    *,
+    models_dev_data: dict | None = None,
+) -> dict:
     """Catalog entry for one model, enriched with capabilities when available.
 
     Source: ``myah_management.py:1538-1561``. Capabilities are omitted on any
     failure — the catalog must never fail because one capability lookup did.
     """
-    from agent.models_dev import get_model_capabilities
-
     entry: dict = {"id": model_id, "name": model_id}
-    try:
-        caps = get_model_capabilities(provider, model_id)
+    if models_dev_data is not None:
+        caps = _capabilities_from_models_dev_snapshot(
+            provider, model_id, models_dev_data
+        )
         if caps is not None:
-            entry["capabilities"] = {
-                "supports_tools": caps.supports_tools,
-                "supports_vision": caps.supports_vision,
-                "supports_reasoning": caps.supports_reasoning,
-                "context_window": caps.context_window,
-                "max_output_tokens": caps.max_output_tokens,
-                "model_family": caps.model_family,
-            }
-    except Exception as exc:
-        logger.warning(f"Failed to fetch capabilities for {provider}/{model_id}: {exc}")
-
+            entry["capabilities"] = caps
     return entry
 
 
@@ -85,12 +145,20 @@ async def _build_catalog() -> dict:
 
     Source: ``myah_management.py:1568-1608``.
     """
+    from agent.models_dev import fetch_models_dev
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_MODELS
     from myah_hermes_plugin.myah_admin.myah_overrides import MYAH_OVERRIDES
     from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
 
     out: dict[str, dict] = {}
+    try:
+        models_dev_data = fetch_models_dev()
+    except Exception as exc:
+        logger.warning(
+            f"Failed to fetch models.dev snapshot for provider catalog: {exc}"
+        )
+        models_dev_data = {}
 
     # Pass 1: entries from upstream CANONICAL_PROVIDERS
     for entry in CANONICAL_PROVIDERS:
@@ -98,7 +166,9 @@ async def _build_catalog() -> dict:
         cfg = PROVIDER_REGISTRY.get(slug)
         # HERMES_OVERLAYS is keyed on models.dev slugs which may differ
         # from CANONICAL_PROVIDERS slugs. Normalise before lookup.
-        overlay = HERMES_OVERLAYS.get(normalize_provider(slug)) or HERMES_OVERLAYS.get(slug)
+        overlay = HERMES_OVERLAYS.get(normalize_provider(slug)) or HERMES_OVERLAYS.get(
+            slug
+        )
         _ = overlay  # parity with legacy; reserved for future overlay-derived fields
 
         catalog_entry = {
@@ -106,9 +176,14 @@ async def _build_catalog() -> dict:
             "display_name": entry.label,
             "description": entry.tui_desc,
             "auth_type": cfg.auth_type if cfg else "api_key",
-            "env_var": (cfg.api_key_env_vars[0] if cfg and cfg.api_key_env_vars else None),
+            "env_var": (
+                cfg.api_key_env_vars[0] if cfg and cfg.api_key_env_vars else None
+            ),
             "inference_base_url": cfg.inference_base_url if cfg else "",
-            "curated_models": [_build_model_entry(slug, m) for m in _PROVIDER_MODELS.get(slug, [])],
+            "curated_models": [
+                _build_model_entry(slug, m, models_dev_data=models_dev_data)
+                for m in _PROVIDER_MODELS.get(slug, [])
+            ],
             "v1_visible": False,
             "write_type": "env_var",
         }
@@ -170,7 +245,9 @@ async def _validate_api_key(catalog_entry: dict, api_key: str) -> tuple[bool, st
             )
             return True, f"optimistic accept (validation HTTP {r.status_code})"
     except httpx.TimeoutException:
-        logger.warning(f"[myah] validation endpoint timed out for {url}; optimistic accept")
+        logger.warning(
+            f"[myah] validation endpoint timed out for {url}; optimistic accept"
+        )
         return True, "optimistic accept (validation timeout)"
     except Exception as exc:
         logger.warning(
@@ -305,8 +382,7 @@ async def connect_credential(provider_id: str, body: ConnectCredentialBody) -> d
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"write_type {write_type!r} not supported here; "
-                "use the OAuth endpoints"
+                f"write_type {write_type!r} not supported here; use the OAuth endpoints"
             ),
         )
 
@@ -395,42 +471,45 @@ class _OAuthSubmitBody(BaseModel):
 
 
 @router.post(
-    '/providers/oauth/{provider_id}/start',
+    "/providers/oauth/{provider_id}/start",
     dependencies=[Depends(require_session_token)],
 )
 async def oauth_start(provider_id: str) -> dict:
     """Plugin-namespace mirror of POST /api/providers/oauth/{id}/start."""
-    return await proxy_to_native('POST', f'/api/providers/oauth/{provider_id}/start')
+    return await proxy_to_native("POST", f"/api/providers/oauth/{provider_id}/start")
 
 
 @router.get(
-    '/providers/oauth/{provider_id}/poll/{session_id}',
+    "/providers/oauth/{provider_id}/poll/{session_id}",
     dependencies=[Depends(require_session_token)],
 )
 async def oauth_poll(provider_id: str, session_id: str) -> dict:
     """Plugin-namespace mirror of GET /api/providers/oauth/{id}/poll/{session_id}."""
     return await proxy_to_native(
-        'GET', f'/api/providers/oauth/{provider_id}/poll/{session_id}',
+        "GET",
+        f"/api/providers/oauth/{provider_id}/poll/{session_id}",
     )
 
 
 @router.post(
-    '/providers/oauth/{provider_id}/submit',
+    "/providers/oauth/{provider_id}/submit",
     dependencies=[Depends(require_session_token)],
 )
 async def oauth_submit(provider_id: str, body: _OAuthSubmitBody) -> dict:
     """Plugin-namespace mirror of POST /api/providers/oauth/{id}/submit (PKCE)."""
     return await proxy_to_native(
-        'POST',
-        f'/api/providers/oauth/{provider_id}/submit',
+        "POST",
+        f"/api/providers/oauth/{provider_id}/submit",
         json_body=body.model_dump(),
     )
 
 
 @router.delete(
-    '/providers/oauth/sessions/{session_id}',
+    "/providers/oauth/sessions/{session_id}",
     dependencies=[Depends(require_session_token)],
 )
 async def oauth_cancel(session_id: str) -> dict:
     """Plugin-namespace mirror of DELETE /api/providers/oauth/sessions/{id}."""
-    return await proxy_to_native('DELETE', f'/api/providers/oauth/sessions/{session_id}')
+    return await proxy_to_native(
+        "DELETE", f"/api/providers/oauth/sessions/{session_id}"
+    )

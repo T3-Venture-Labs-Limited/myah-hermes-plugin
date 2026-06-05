@@ -122,6 +122,21 @@ class TestPluginRegistersMyahPlatform:
             "updating the platform companions resurrects the B1 bug."
         )
 
+    def test_knowledge_base_tool_registered(self, captured_registration: _RecordingContext) -> None:
+        entries = [tool for tool in captured_registration.tools if tool.get("name") == "knowledge_base"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.get("toolset") == "knowledge_base"
+        assert callable(entry.get("handler"))
+        assert entry.get("schema", {}).get("name") == "knowledge_base"
+
+    def test_knowledge_base_pre_tool_guard_registered(
+        self, captured_registration: _RecordingContext
+    ) -> None:
+        from myah_hermes_plugin.myah_tools.knowledge_base_tool import guard_relative_wiki_write
+
+        assert ("pre_tool_call", guard_relative_wiki_write) in captured_registration.hooks
+
     def test_adapter_factory_constructible(
         self, captured_registration: _RecordingContext
     ) -> None:
