@@ -21,7 +21,7 @@ import urllib.request
 from typing import Any
 
 from .. import sentry_init
-from ..myah_tools import secrets_tool
+from ..myah_tools import knowledge_base_tool, secrets_tool
 from .pre_dispatch_hook import myah_pre_gateway_dispatch
 
 log = logging.getLogger(__name__)
@@ -335,6 +335,21 @@ def register(ctx: Any) -> None:
     # NOT live in upstream gateway/run.py.
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("pre_gateway_dispatch", myah_pre_gateway_dispatch)
+
+    # ── Knowledge Base tool + guard registration (T3-1034) ─────────────
+    ctx.register_tool(
+        name="knowledge_base",
+        toolset="knowledge_base",
+        schema=knowledge_base_tool.SCHEMA,
+        handler=knowledge_base_tool.handle,
+        emoji="📚",
+        description=(
+            "Read, list, and write markdown files in the Myah Knowledge Base "
+            "using wiki-relative paths sandboxed under WIKI_PATH."
+        ),
+    )
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_tool_call", knowledge_base_tool.guard_relative_wiki_write)
 
     # ── Secrets tool registration (Phase 4c) ───────────────────────────
     ctx.register_tool(
