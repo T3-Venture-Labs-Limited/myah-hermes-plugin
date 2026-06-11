@@ -256,6 +256,7 @@ def test_brand_import_without_fixture_evidence_surfaces_warning(monkeypatch, tmp
 
     assert response.status_code == 200
     summary = response.json()["package"]["evidence_summary"]
+    assert summary["product_source"] == "none"
     assert "no_fixture_evidence" in summary["warnings"]
 
 
@@ -325,6 +326,51 @@ def test_connected_mode_manual_evidence_can_be_approved(monkeypatch, tmp_path):
     assert start.status_code == 200
     package = start.json()["package"]
     assert "manual" in package["evidence_summary"]["visual_sources"]
+
+    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    assert approve.status_code == 200
+
+
+def test_manual_name_voice_only_can_be_approved(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://manual-name.example",
+            "manual_evidence": {"brand_name": "Voice Brand", "voice": "practical and premium"},
+        },
+    )
+    assert start.status_code == 200
+    package = start.json()["package"]
+    assert package["brand"]["name"] == "Voice Brand"
+    assert package["brand"]["voice"] == "practical and premium"
+    assert "manual" in package["evidence_summary"]["visual_sources"]
+
+    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    assert approve.status_code == 200
+    readme = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
+    skill = (
+        tmp_path / "hermes" / "profiles" / "creative-director" / "skills" / "brand-style-guide" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Voice: practical and premium" in readme
+    assert "practical and premium" in skill
+
+
+def test_manual_brand_import_does_not_require_shop_url(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "manual_evidence": {"brand_name": "Manual Only", "voice": "friendly ecommerce operator"},
+        },
+    )
+    assert start.status_code == 200
+    package = start.json()["package"]
+    assert package["shop_url"] is None
+    assert package["brand"]["domain"] is None
+    assert package["evidence_summary"]["product_source"] == "manual"
 
     approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
     assert approve.status_code == 200

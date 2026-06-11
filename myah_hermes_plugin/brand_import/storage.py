@@ -159,6 +159,7 @@ class BrandImportStore:
         name = _safe_text(brand.get("name")) or "Brand"
         colors = brand.get("colors") or {}
         typography = brand.get("typography") or {}
+        voice = _safe_text(brand.get("voice"), max_len=500)
         readme = [
             f"# {name}",
             "",
@@ -173,6 +174,7 @@ class BrandImportStore:
             f"- Favicon URL: {_safe_text(brand.get('favicon_url'), max_len=500)}",
             f"- Colors: {json.dumps(colors, sort_keys=True)}",
             f"- Typography: {json.dumps(typography, sort_keys=True)}",
+            f"- Voice: {voice}",
             "",
         ]
         _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
@@ -216,6 +218,7 @@ class BrandImportStore:
     def write_brand_style_skill(self, package: dict[str, Any]) -> None:
         brand = package.get("brand") or {}
         name = _safe_text(brand.get("name")) or "the brand"
+        voice = _safe_text(brand.get("voice"), max_len=500)
         skill_dir = self.profile_home / "skills" / "brand-style-guide"
         skill_dir.mkdir(parents=True, exist_ok=True)
         slug_name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "brand"
@@ -230,6 +233,10 @@ description: "{escaped_description}"
 
 Brand: {name}
 Canonical brand slug: `{slug_name}`
+
+## Brand voice
+
+{voice or 'No explicit brand voice was imported yet.'}
 
 ## Source
 

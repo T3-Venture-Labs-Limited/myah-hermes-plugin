@@ -62,7 +62,7 @@ def _public_products(urls: list[str]) -> list[dict[str, Any]]:
 
 def build_brand_package(
     *,
-    shop_url: str,
+    shop_url: str | None,
     api_evidence: dict[str, Any] | None = None,
     theme_evidence: dict[str, Any] | None = None,
     scrape_evidence: dict[str, Any] | None = None,
@@ -86,7 +86,10 @@ def build_brand_package(
     theme_settings = theme.get("settings") or {}
 
     products = _api_products(list(api.get("products") or []))
-    product_source = "shopify_api" if products else "public_storefront"
+    manual_has_evidence = any(
+        manual.get(key) for key in ("visual_identity", "brand_name", "name", "voice", "shop")
+    )
+    product_source = "shopify_api" if products else ("public_storefront" if public_product_urls else ("manual" if manual_has_evidence else "none"))
     if not products:
         products = _public_products(public_product_urls or [])
 

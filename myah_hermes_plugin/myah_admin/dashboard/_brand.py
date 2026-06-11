@@ -21,7 +21,7 @@ router = APIRouter(prefix="/brand", tags=["brand-import"])
 
 
 class BrandImportStartRequest(BaseModel):
-    shop_url: str = Field(..., min_length=1)
+    shop_url: str | None = Field(default=None)
     connected_shopify: bool = False
     api_evidence: dict[str, Any] | None = None
     theme_evidence: dict[str, Any] | None = None
@@ -65,7 +65,7 @@ async def start_brand_import(
         else None
     )
     evidence = collect_brand_evidence(
-        request.shop_url,
+        request.shop_url or "",
         connected_shopify=request.connected_shopify,
         fixture=fixture,
     )
