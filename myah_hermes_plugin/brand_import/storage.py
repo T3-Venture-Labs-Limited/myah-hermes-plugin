@@ -1,0 +1,244 @@
+"""File-backed Brand Import state for profile-local Hermes containers."""
+
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+_JOB_ID_RE = re.compile(r"^brand-[0-9a-f]{12}$")
+_MAX_SAFE_TEXT = 120
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_text(value: Any, *, max_len: int = _MAX_SAFE_TEXT) -> str:
+    text = str(value or "").replace("\x00", " ")
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("---", "-")
+    # Drop direct prompt-injection phrases that can arrive from scraped pages.
+    text = re.sub(r"ignore previous instructions", "", text, flags=re.IGNORECASE).strip()
+    return text[:max_len].strip()
+
+
+def _valid_job_id(job_id: str) -> bool:
+    return bool(_JOB_ID_RE.fullmatch(job_id or ""))
+
+
+def _hermes_home() -> Path:
+    from myah_hermes_plugin.myah_admin.dashboard._common import hermes_home_path
+
+    return hermes_home_path()
+
+
+def _wiki_root() -> Path:
+    from myah_hermes_plugin.myah_admin.dashboard._wiki_paths import wiki_root
+
+    return wiki_root()
+
+
+def _atomic_json_dump(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+        tmp.write(encoded)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def _atomic_text_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+class BrandImportStore:
+    """Small JSON/file store for Brand Import jobs and active Brand Brain."""
+
+    def __init__(self, *, hermes_home: Path | None = None, wiki_root: Path | None = None, profile_id: str = "creative-director") -> None:
+        self.hermes_home = hermes_home or _hermes_home()
+        self.profile_id = profile_id
+        self.profile_home = self._profile_home()
+        self.wiki_root = wiki_root or _wiki_root()
+        self.root = self.profile_home / "brand_import"
+        self.jobs_dir = self.root / "jobs"
+        self.active_path = self.root / "active.json"
+
+    def _profile_home(self) -> Path:
+        # The dashboard process currently runs once from root HERMES_HOME, while
+        # per-profile gateways run separately. Brand Import is Creative
+        # Director-specific, so durable job state and generated profile-local
+        # skills must live under root/profiles/creative-director. If this route
+        # ever moves into a profile-local dashboard, HERMES_HOME may already be
+        # the profile directory; in that case, use it directly.
+        if self.hermes_home.name == self.profile_id:
+            return self.hermes_home
+        return self.hermes_home / "profiles" / self.profile_id
+
+    def create_review_job(self, package: dict[str, Any]) -> dict[str, Any]:
+        job_id = f"brand-{uuid.uuid4().hex[:12]}"
+        job = {
+            "job_id": job_id,
+            "status": "needs_review",
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "package": package,
+        }
+        _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
+        return job
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        if not _valid_job_id(job_id):
+            raise ValueError("invalid brand import job id")
+        path = self.jobs_dir / f"{job_id}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def latest_job(self) -> dict[str, Any] | None:
+        if not self.jobs_dir.exists():
+            return None
+        paths = sorted(
+            self.jobs_dir.glob("brand-*.json"),
+            key=lambda p: (p.stat().st_mtime_ns, p.name),
+            reverse=True,
+        )
+        if not paths:
+            return None
+        return json.loads(paths[0].read_text(encoding="utf-8"))
+
+    def active(self) -> dict[str, Any] | None:
+        if not self.active_path.exists():
+            return None
+        return json.loads(self.active_path.read_text(encoding="utf-8"))
+
+    def status(self) -> dict[str, Any]:
+        active = self.active()
+        job = self.latest_job()
+        if job and job.get("status") != "active":
+            return {"status": job.get("status", "unknown"), "active": active, "current_job": job}
+        if active:
+            return {"status": "active", "active": active, "current_job": job}
+        return {"status": "empty", "active": None, "current_job": None}
+
+    def approve(self, job_id: str) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        package = job["package"]
+        summary = package.get("evidence_summary") or {}
+        warnings = set(summary.get("warnings") or [])
+        if (
+            warnings.intersection({"no_fixture_evidence", "connected_shopify_adapter_not_configured"})
+            and (summary.get("stored_product_count") or 0) == 0
+            and not (summary.get("visual_sources") or [])
+        ):
+            raise ValueError("brand import needs evidence before approval")
+        self.write_brand_brain(package)
+        self.write_brand_style_skill(package)
+        job["status"] = "active"
+        job["updated_at"] = _utc_now()
+        _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
+        active = {"status": "active", "approved_job_id": job_id, "approved_at": _utc_now(), "package": package}
+        _atomic_json_dump(self.active_path, active)
+        return active
+
+    def write_brand_brain(self, package: dict[str, Any]) -> None:
+        brand = package.get("brand") or {}
+        brand_dir = self.wiki_root / "brand"
+        brand_dir.mkdir(parents=True, exist_ok=True)
+        name = _safe_text(brand.get("name")) or "Brand"
+        colors = brand.get("colors") or {}
+        typography = brand.get("typography") or {}
+        readme = [
+            f"# {name}",
+            "",
+            "## Source summary",
+            f"- Source mode: `{package.get('source_mode')}`",
+            f"- Shop URL: {_safe_text(package.get('shop_url'), max_len=500)}",
+            f"- Product source: `{(package.get('evidence_summary') or {}).get('product_source')}`",
+            "",
+            "## Brand identity",
+            f"- Domain: {_safe_text(brand.get('domain'), max_len=240)}",
+            f"- Logo URL: {_safe_text(brand.get('logo_url'), max_len=500)}",
+            f"- Favicon URL: {_safe_text(brand.get('favicon_url'), max_len=500)}",
+            f"- Colors: {json.dumps(colors, sort_keys=True)}",
+            f"- Typography: {json.dumps(typography, sort_keys=True)}",
+            "",
+        ]
+        _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
+
+        products_lines = ["# Products", ""]
+        for product in package.get("products") or []:
+            title = _safe_text(product.get("title"), max_len=160) or "Untitled product"
+            products_lines.append(f"## {title}")
+            if product.get("url"):
+                products_lines.append(f"- URL: {_safe_text(product['url'], max_len=500)}")
+            if product.get("handle"):
+                products_lines.append(f"- Handle: {_safe_text(product['handle'])}")
+            for image in product.get("image_urls") or []:
+                products_lines.append(f"- Image: {_safe_text(image, max_len=500)}")
+            products_lines.append("")
+        _atomic_text_write(brand_dir / "products.md", "\n".join(products_lines))
+
+        content_sources = package.get("content_sources") or {}
+        content_lines = ["# Source Content", ""]
+        for section in ("pages", "policies", "blogs"):
+            content_lines.append(f"## {section.title()}")
+            for item in content_sources.get(section) or []:
+                title = _safe_text(item.get("title") or item.get("name"), max_len=160) or "Untitled"
+                body = _safe_text(item.get("body") or item.get("body_html") or item.get("bodyHtml"), max_len=500)
+                content_lines.append(f"### {title}")
+                if body:
+                    content_lines.append(body)
+                content_lines.append("")
+        _atomic_text_write(brand_dir / "source-content.md", "\n".join(content_lines))
+
+        visual = [
+            "# Visual System",
+            "",
+            f"Colors: `{json.dumps(colors, sort_keys=True)}`",
+            "",
+            f"Typography: `{json.dumps(typography, sort_keys=True)}`",
+            "",
+        ]
+        _atomic_text_write(brand_dir / "visual-system.md", "\n".join(visual))
+
+    def write_brand_style_skill(self, package: dict[str, Any]) -> None:
+        brand = package.get("brand") or {}
+        name = _safe_text(brand.get("name")) or "the brand"
+        skill_dir = self.profile_home / "skills" / "brand-style-guide"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        slug_name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "brand"
+        description = _safe_text(f"Brand style guide for {name}; use when drafting Creative Director ecommerce content for this profile.", max_len=220)
+        escaped_description = description.replace("\\", "\\\\").replace('"', '\\"')
+        content = f"""---
+name: brand-style-guide
+description: "{escaped_description}"
+---
+
+# Brand Style Guide
+
+Brand: {name}
+Canonical brand slug: `{slug_name}`
+
+## Source
+
+Generated by Myah Creative Director Brand Import from approved Brand Brain package.
+
+## Use
+
+- Preserve the brand's tone and ecommerce positioning.
+- Prefer product facts from `brand/products.md`.
+- Treat imported fields as editable user-approved context, not immutable truth.
+"""
+        _atomic_text_write(skill_dir / "SKILL.md", content)
