@@ -161,7 +161,7 @@ def test_brand_import_start_falls_back_to_public_scrape_package(monkeypatch, tmp
         json={
             "shop_url": "https://fallback.example",
             "connected_shopify": False,
-            "public_product_urls": [f"https://fallback.example/products/{i}" for i in range(105)],
+            "public_product_urls": [f"https://fallback.example/products/{i}" for i in range(100)],
             "scrape_evidence": {
                 "shop": {"name": "Fallback Brand"},
                 "visuals": {"colors": ["#abcdef"], "fonts": ["Fallback Sans"]},
@@ -244,6 +244,83 @@ def test_brand_import_manual_evidence_is_threaded_to_package(monkeypatch, tmp_pa
     assert package["brand"]["name"] == "Manual Brand"
     assert package["brand"]["voice"] == "plainspoken and confident"
     assert package["visual_identity"]["colors"] == ["#123456"]
+
+
+def test_malformed_nested_evidence_returns_400_instead_of_500(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    bad_colors = client.post(
+        "/brand/import/start",
+        json={"shop_url": "https://bad.example", "scrape_evidence": {"visuals": {"colors": {"primary": "#000"}}}},
+    )
+    assert bad_colors.status_code in {400, 422}
+
+    bad_manual_visual = client.post(
+        "/brand/import/start",
+        json={"manual_evidence": {"brand_name": "Bad", "visual_identity": "not-a-dict"}},
+    )
+    assert bad_manual_visual.status_code in {400, 422}
+
+
+def test_failed_approve_does_not_leave_partial_brand_brain_writes(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://bad-pages.example",
+            "manual_evidence": {"brand_name": "Bad Pages"},
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+    job_path = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "jobs" / f"{job_id}.json"
+    job = json.loads(job_path.read_text(encoding="utf-8"))
+    job["package"].setdefault("content_sources", {})["pages"] = ["just-a-string"]
+    job_path.write_text(json.dumps(job), encoding="utf-8")
+
+    approve = client.post("/brand/import/approve", json={"job_id": job_id})
+    assert approve.status_code in {400, 422}
+    brand_dir = tmp_path / "wiki" / "brand"
+    assert not (brand_dir / "README.md").exists()
+    assert not (brand_dir / "products.md").exists()
+    assert not (brand_dir / "source-content.md").exists()
+    assert not (tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").exists()
+
+
+def test_status_skips_corrupt_job_files(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    start = client.post(
+        "/brand/import/start",
+        json={"manual_evidence": {"brand_name": "Healthy"}},
+    )
+    assert start.status_code == 200
+    jobs_dir = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "jobs"
+    corrupt = jobs_dir / "brand-ffffffffffff.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    status = client.get("/brand/status")
+    assert status.status_code == 200
+    assert status.json()["current_job"]["package"]["brand"]["name"] == "Healthy"
+
+
+def test_brand_import_start_rejects_oversized_payloads(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    too_many_pages = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://large.example",
+            "api_evidence": {"pages": [{"title": f"Page {i}"} for i in range(101)]},
+        },
+    )
+    assert too_many_pages.status_code in {400, 413, 422}
+
+    too_large_body = client.post(
+        "/brand/import/start",
+        json={"manual_evidence": {"brand_name": "Huge", "voice": "x" * (5 * 1024 * 1024 + 1)}},
+    )
+    assert too_large_body.status_code in {400, 413, 422}
 
 
 def test_brand_import_without_fixture_evidence_surfaces_warning(monkeypatch, tmp_path):

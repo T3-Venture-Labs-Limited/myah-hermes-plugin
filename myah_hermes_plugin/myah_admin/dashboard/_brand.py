@@ -8,6 +8,7 @@ proxy to these routes rather than writing `/data/.hermes` directly.
 from __future__ import annotations
 
 from typing import Any
+import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -18,6 +19,34 @@ from ...brand_import.storage import BrandImportStore
 from ._common import require_session_token
 
 router = APIRouter(prefix="/brand", tags=["brand-import"])
+
+MAX_IMPORT_TOTAL_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_ITEMS = 100
+
+
+def _request_payload(request: BaseModel) -> dict[str, Any]:
+    if hasattr(request, "model_dump"):
+        return request.model_dump(exclude_none=True)  # pydantic v2
+    return request.dict(exclude_none=True)  # pydantic v1 fallback
+
+
+def _reject_oversized_start_payload(request: "BrandImportStartRequest") -> None:
+    payload = _request_payload(request)
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > MAX_IMPORT_TOTAL_BYTES:
+        raise HTTPException(status_code=413, detail="brand import payload too large")
+
+    list_checks = [
+        (payload, "public_product_urls"),
+        (payload.get("api_evidence") or {}, "products"),
+        (payload.get("api_evidence") or {}, "pages"),
+        (payload.get("api_evidence") or {}, "policies"),
+        (payload.get("api_evidence") or {}, "blogs"),
+    ]
+    for container, key in list_checks:
+        value = container.get(key) if isinstance(container, dict) else None
+        if isinstance(value, list) and len(value) > MAX_IMPORT_ITEMS:
+            raise HTTPException(status_code=413, detail=f"brand import {key} exceeds {MAX_IMPORT_ITEMS} item limit")
 
 
 class BrandImportStartRequest(BaseModel):
@@ -44,6 +73,7 @@ async def start_brand_import(
     request: BrandImportStartRequest,
     _auth: None = Depends(require_session_token),
 ) -> dict[str, Any]:
+    _reject_oversized_start_payload(request)
     has_fixture_evidence = any(
         [
             request.api_evidence,
@@ -69,14 +99,17 @@ async def start_brand_import(
         connected_shopify=request.connected_shopify,
         fixture=fixture,
     )
-    package = build_brand_package(
-        shop_url=request.shop_url,
-        api_evidence=evidence.api_evidence,
-        theme_evidence=evidence.theme_evidence,
-        scrape_evidence=evidence.scrape_evidence,
-        public_product_urls=evidence.public_product_urls,
-        manual_evidence=evidence.manual_evidence,
-    )
+    try:
+        package = build_brand_package(
+            shop_url=request.shop_url,
+            api_evidence=evidence.api_evidence,
+            theme_evidence=evidence.theme_evidence,
+            scrape_evidence=evidence.scrape_evidence,
+            public_product_urls=evidence.public_product_urls,
+            manual_evidence=evidence.manual_evidence,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if evidence.warnings:
         package.setdefault("evidence_summary", {}).setdefault("warnings", []).extend(evidence.warnings)
     job = BrandImportStore().create_review_job(package)

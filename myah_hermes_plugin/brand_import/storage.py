@@ -112,9 +112,12 @@ class BrandImportStore:
             key=lambda p: (p.stat().st_mtime_ns, p.name),
             reverse=True,
         )
-        if not paths:
-            return None
-        return json.loads(paths[0].read_text(encoding="utf-8"))
+        for path in paths:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+        return None
 
     def active(self) -> dict[str, Any] | None:
         if not self.active_path.exists():
@@ -155,7 +158,6 @@ class BrandImportStore:
     def write_brand_brain(self, package: dict[str, Any]) -> None:
         brand = package.get("brand") or {}
         brand_dir = self.wiki_root / "brand"
-        brand_dir.mkdir(parents=True, exist_ok=True)
         name = _safe_text(brand.get("name")) or "Brand"
         colors = brand.get("colors") or {}
         typography = brand.get("typography") or {}
@@ -177,10 +179,11 @@ class BrandImportStore:
             f"- Voice: {voice}",
             "",
         ]
-        _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
 
         products_lines = ["# Products", ""]
-        for product in package.get("products") or []:
+        for index, product in enumerate(package.get("products") or []):
+            if not isinstance(product, dict):
+                raise ValueError(f"invalid products[{index}]: expected object")
             title = _safe_text(product.get("title"), max_len=160) or "Untitled product"
             products_lines.append(f"## {title}")
             if product.get("url"):
@@ -190,20 +193,20 @@ class BrandImportStore:
             for image in product.get("image_urls") or []:
                 products_lines.append(f"- Image: {_safe_text(image, max_len=500)}")
             products_lines.append("")
-        _atomic_text_write(brand_dir / "products.md", "\n".join(products_lines))
 
         content_sources = package.get("content_sources") or {}
         content_lines = ["# Source Content", ""]
         for section in ("pages", "policies", "blogs"):
             content_lines.append(f"## {section.title()}")
-            for item in content_sources.get(section) or []:
+            for index, item in enumerate(content_sources.get(section) or []):
+                if not isinstance(item, dict):
+                    raise ValueError(f"invalid content_sources.{section}[{index}]: expected object")
                 title = _safe_text(item.get("title") or item.get("name"), max_len=160) or "Untitled"
                 body = _safe_text(item.get("body") or item.get("body_html") or item.get("bodyHtml"), max_len=500)
                 content_lines.append(f"### {title}")
                 if body:
                     content_lines.append(body)
                 content_lines.append("")
-        _atomic_text_write(brand_dir / "source-content.md", "\n".join(content_lines))
 
         visual = [
             "# Visual System",
@@ -213,6 +216,11 @@ class BrandImportStore:
             f"Typography: `{json.dumps(typography, sort_keys=True)}`",
             "",
         ]
+
+        brand_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
+        _atomic_text_write(brand_dir / "products.md", "\n".join(products_lines))
+        _atomic_text_write(brand_dir / "source-content.md", "\n".join(content_lines))
         _atomic_text_write(brand_dir / "visual-system.md", "\n".join(visual))
 
     def write_brand_style_skill(self, package: dict[str, Any]) -> None:

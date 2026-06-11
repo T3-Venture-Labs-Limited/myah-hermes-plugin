@@ -31,6 +31,37 @@ def _image_urls(product: dict[str, Any]) -> list[str]:
     return urls
 
 
+def _ensure_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid {field}: expected object")
+    return value
+
+
+def _ensure_list(value: Any, *, field: str) -> list[Any]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"invalid {field}: expected list")
+    return value
+
+
+def _string_list(value: Any, *, field: str) -> list[str]:
+    items = _ensure_list(value, field=field)
+    return [item.strip() for item in items if isinstance(item, str) and item.strip()]
+
+
+def _dict_list(value: Any, *, field: str) -> list[dict[str, Any]]:
+    items = _ensure_list(value, field=field)
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"invalid {field}[{index}]: expected object")
+        out.append(item)
+    return out
+
+
 def _api_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for product in products[:100]:
@@ -75,17 +106,20 @@ def build_brand_package(
     merchant/API evidence > theme settings/assets > scrape-light > manual fill.
     Public products are used only when Shopify API products are absent.
     """
-    api = api_evidence or {}
-    theme = theme_evidence or {}
-    scrape = scrape_evidence or {}
-    manual = manual_evidence or {}
+    api = _ensure_mapping(api_evidence, field="api_evidence")
+    theme = _ensure_mapping(theme_evidence, field="theme_evidence")
+    scrape = _ensure_mapping(scrape_evidence, field="scrape_evidence")
+    manual = _ensure_mapping(manual_evidence, field="manual_evidence")
 
-    shop = api.get("shop") or scrape.get("shop") or manual.get("shop") or {}
-    brand = api.get("brand") or {}
-    visuals = scrape.get("visuals") or scrape.get("visual_identity") or manual.get("visual_identity") or {}
-    theme_settings = theme.get("settings") or {}
+    shop = _ensure_mapping(api.get("shop") or scrape.get("shop") or manual.get("shop"), field="shop")
+    brand = _ensure_mapping(api.get("brand"), field="api_evidence.brand")
+    visuals = _ensure_mapping(
+        scrape.get("visuals") or scrape.get("visual_identity") or manual.get("visual_identity"),
+        field="visual_identity",
+    )
+    theme_settings = _ensure_mapping(theme.get("settings"), field="theme_evidence.settings")
 
-    products = _api_products(list(api.get("products") or []))
+    products = _api_products(_dict_list(api.get("products"), field="api_evidence.products"))
     manual_has_evidence = any(
         manual.get(key) for key in ("visual_identity", "brand_name", "name", "voice", "shop")
     )
@@ -93,19 +127,22 @@ def build_brand_package(
     if not products:
         products = _public_products(public_product_urls or [])
 
+    visual_colors = _string_list(visuals.get("colors"), field="visual_identity.colors")
+    visual_fonts = _string_list(visuals.get("fonts"), field="visual_identity.fonts")
+
     colors = dict(brand.get("colors") or {})
     if not colors and isinstance(theme_settings.get("colors"), dict):
         colors.update(theme_settings["colors"])
-    if visuals.get("colors"):
-        colors.setdefault("primary", visuals["colors"][0])
-        if len(visuals["colors"]) > 1:
-            colors.setdefault("accent", visuals["colors"][1])
+    if visual_colors:
+        colors.setdefault("primary", visual_colors[0])
+        if len(visual_colors) > 1:
+            colors.setdefault("accent", visual_colors[1])
 
     typography = dict(theme_settings.get("typography") or {})
-    if visuals.get("fonts"):
-        typography.setdefault("body", visuals["fonts"][0])
-        if len(visuals["fonts"]) > 1:
-            typography.setdefault("fallback", visuals["fonts"][1])
+    if visual_fonts:
+        typography.setdefault("body", visual_fonts[0])
+        if len(visual_fonts) > 1:
+            typography.setdefault("fallback", visual_fonts[1])
 
     logo = brand.get("logo") or {}
     logo_url = _first_str(logo.get("url") if isinstance(logo, dict) else logo, visuals.get("logo_url"))
@@ -136,16 +173,16 @@ def build_brand_package(
             "voice": _first_str(manual.get("voice")),
         },
         "visual_identity": {
-            "colors": visuals.get("colors") or [],
-            "fonts": visuals.get("fonts") or [],
+            "colors": visual_colors,
+            "fonts": visual_fonts,
             "logo_url": logo_url,
             "favicon_url": _first_str(visuals.get("favicon_url")),
         },
         "products": products,
         "content_sources": {
-            "pages": list(api.get("pages") or []),
-            "policies": list(api.get("policies") or []),
-            "blogs": list(api.get("blogs") or []),
+            "pages": _dict_list(api.get("pages"), field="api_evidence.pages"),
+            "policies": _dict_list(api.get("policies"), field="api_evidence.policies"),
+            "blogs": _dict_list(api.get("blogs"), field="api_evidence.blogs"),
         },
         "evidence_summary": {
             "product_source": product_source,
