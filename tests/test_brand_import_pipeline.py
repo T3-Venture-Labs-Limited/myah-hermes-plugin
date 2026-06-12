@@ -301,7 +301,100 @@ def test_status_skips_corrupt_job_files(monkeypatch, tmp_path):
 
     status = client.get("/brand/status")
     assert status.status_code == 200
-    assert status.json()["current_job"]["package"]["brand"]["name"] == "Healthy"
+    assert status.json()["status"] == "failed"
+    assert status.json()["current_job"]["job_id"] == "brand-ffffffffffff"
+    assert status.json()["current_job"]["error"] == "corrupt_brand_import_job"
+
+
+def test_status_ignores_corrupt_active_manifest(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    active_path = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text("{not-json", encoding="utf-8")
+
+    status = client.get("/brand/status")
+
+    assert status.status_code == 200
+    assert status.json() == {"status": "empty", "active": None, "current_job": None}
+
+
+def test_approve_corrupt_job_file_returns_not_found_not_500(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    jobs_dir = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / "brand-aaaaaaaaaaaa.json").write_text("{not-json", encoding="utf-8")
+
+    approve = client.post("/brand/import/approve", json={"job_id": "brand-aaaaaaaaaaaa"})
+
+    assert approve.status_code == 404
+    assert approve.json()["detail"] == "brand import job not found"
+
+
+def test_malformed_product_images_and_social_links_return_400(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    bad_images = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://bad.example",
+            "api_evidence": {"products": [{"title": "Serum", "images": "https://cdn.example/a.png"}]},
+        },
+    )
+    assert bad_images.status_code == 400
+    assert bad_images.json()["detail"] == "invalid api_evidence.products[0].images: expected list"
+
+    bad_social = client.post(
+        "/brand/import/start",
+        json={"shop_url": "https://bad.example", "scrape_evidence": {"social_links": "https://instagram.com/bad"}},
+    )
+    assert bad_social.status_code == 400
+    assert bad_social.json()["detail"] == "invalid scrape_evidence.social_links: expected list"
+
+
+def test_rest_style_product_tag_string_is_normalized(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://rest.example",
+            "api_evidence": {"products": [{"title": "Serum", "tags": "skincare, serum, premium"}]},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["package"]["products"][0]["tags"] == ["skincare", "serum", "premium"]
+
+
+def test_malformed_brand_color_and_typography_mappings_return_clear_400(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    bad_brand_colors = client.post(
+        "/brand/import/start",
+        json={"shop_url": "https://bad.example", "api_evidence": {"brand": {"colors": ["#112233"]}}},
+    )
+    assert bad_brand_colors.status_code == 400
+    assert bad_brand_colors.json()["detail"] == "invalid api_evidence.brand.colors: expected object"
+
+    bad_typography = client.post(
+        "/brand/import/start",
+        json={"shop_url": "https://bad.example", "theme_evidence": {"settings": {"typography": ["Inter"]}}},
+    )
+    assert bad_typography.status_code == 400
+    assert bad_typography.json()["detail"] == "invalid theme_evidence.settings.typography: expected object"
+
+
+def test_start_import_rejects_large_content_length_before_json_parse(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/brand/import/start",
+        content=b'{"manual_evidence":{"brand_name":"Huge"}}',
+        headers={"content-type": "application/json", "content-length": str(_brand.MAX_IMPORT_TOTAL_BYTES + 1)},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "brand import payload too large"
 
 
 def test_brand_import_start_rejects_oversized_payloads(monkeypatch, tmp_path):

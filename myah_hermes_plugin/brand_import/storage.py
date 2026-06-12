@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import tempfile
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 
 _JOB_ID_RE = re.compile(r"^brand-[0-9a-f]{12}$")
 _MAX_SAFE_TEXT = 120
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -61,6 +63,27 @@ def _atomic_text_write(path: Path, content: str) -> None:
     tmp_path.replace(path)
 
 
+def _load_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Skipping unreadable Brand Import JSON %s: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Skipping non-object Brand Import JSON %s", path)
+        return None
+    return payload
+
+
+def _corrupt_job_marker(path: Path) -> dict[str, Any]:
+    return {
+        "job_id": path.stem,
+        "status": "failed",
+        "error": "corrupt_brand_import_job",
+        "updated_at": _utc_now(),
+    }
+
+
 class BrandImportStore:
     """Small JSON/file store for Brand Import jobs and active Brand Brain."""
 
@@ -102,27 +125,30 @@ class BrandImportStore:
         path = self.jobs_dir / f"{job_id}.json"
         if not path.exists():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _load_json_object(path)
 
     def latest_job(self) -> dict[str, Any] | None:
         if not self.jobs_dir.exists():
             return None
-        paths = sorted(
-            self.jobs_dir.glob("brand-*.json"),
-            key=lambda p: (p.stat().st_mtime_ns, p.name),
-            reverse=True,
-        )
-        for path in paths:
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+        candidates: list[tuple[int, str, Path]] = []
+        for path in self.jobs_dir.glob("brand-*.json"):
+            if not _valid_job_id(path.stem):
                 continue
+            try:
+                candidates.append((path.stat().st_mtime_ns, path.name, path))
+            except OSError as exc:
+                logger.warning("Skipping Brand Import job that disappeared during status lookup %s: %s", path, exc)
+        for _mtime, _name, path in sorted(candidates, reverse=True):
+            job = _load_json_object(path)
+            if job is None:
+                return _corrupt_job_marker(path)
+            return job
         return None
 
     def active(self) -> dict[str, Any] | None:
         if not self.active_path.exists():
             return None
-        return json.loads(self.active_path.read_text(encoding="utf-8"))
+        return _load_json_object(self.active_path)
 
     def status(self) -> dict[str, Any]:
         active = self.active()

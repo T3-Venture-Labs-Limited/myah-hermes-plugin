@@ -19,13 +19,15 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
-def _image_urls(product: dict[str, Any]) -> list[str]:
+def _image_urls(product: dict[str, Any], *, field: str) -> list[str]:
     urls: list[str] = []
-    for image in product.get("images") or []:
+    for index, image in enumerate(_ensure_list(product.get("images"), field=field)):
         if isinstance(image, dict):
             url = _first_str(image.get("url"), image.get("src"), image.get("originalSrc"))
-        else:
+        elif isinstance(image, str):
             url = _first_str(image)
+        else:
+            raise ValueError(f"invalid {field}[{index}]: expected object or string")
         if url:
             urls.append(url)
     return urls
@@ -52,6 +54,12 @@ def _string_list(value: Any, *, field: str) -> list[str]:
     return [item.strip() for item in items if isinstance(item, str) and item.strip()]
 
 
+def _tag_list(value: Any, *, field: str) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return _string_list(value, field=field)
+
+
 def _dict_list(value: Any, *, field: str) -> list[dict[str, Any]]:
     items = _ensure_list(value, field=field)
     out: list[dict[str, Any]] = []
@@ -64,7 +72,7 @@ def _dict_list(value: Any, *, field: str) -> list[dict[str, Any]]:
 
 def _api_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for product in products[:100]:
+    for index, product in enumerate(products[:100]):
         handle = _first_str(product.get("handle"))
         url = _first_str(product.get("onlineStoreUrl"), product.get("url"))
         out.append(
@@ -76,8 +84,8 @@ def _api_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "description": _first_str(product.get("description"), product.get("body_html"), product.get("bodyHtml")),
                 "vendor": _first_str(product.get("vendor")),
                 "product_type": _first_str(product.get("product_type"), product.get("productType")),
-                "tags": product.get("tags") or [],
-                "image_urls": _image_urls(product),
+                "tags": _tag_list(product.get("tags"), field=f"api_evidence.products[{index}].tags"),
+                "image_urls": _image_urls(product, field=f"api_evidence.products[{index}].images"),
                 "source": "shopify_api",
             }
         )
@@ -119,7 +127,8 @@ def build_brand_package(
     )
     theme_settings = _ensure_mapping(theme.get("settings"), field="theme_evidence.settings")
 
-    products = _api_products(_dict_list(api.get("products"), field="api_evidence.products"))
+    api_products = _dict_list(api.get("products"), field="api_evidence.products")
+    products = _api_products(api_products)
     manual_has_evidence = any(
         manual.get(key) for key in ("visual_identity", "brand_name", "name", "voice", "shop")
     )
@@ -130,15 +139,16 @@ def build_brand_package(
     visual_colors = _string_list(visuals.get("colors"), field="visual_identity.colors")
     visual_fonts = _string_list(visuals.get("fonts"), field="visual_identity.fonts")
 
-    colors = dict(brand.get("colors") or {})
-    if not colors and isinstance(theme_settings.get("colors"), dict):
-        colors.update(theme_settings["colors"])
+    colors = dict(_ensure_mapping(brand.get("colors"), field="api_evidence.brand.colors"))
+    theme_colors = _ensure_mapping(theme_settings.get("colors"), field="theme_evidence.settings.colors")
+    if not colors and theme_colors:
+        colors.update(theme_colors)
     if visual_colors:
         colors.setdefault("primary", visual_colors[0])
         if len(visual_colors) > 1:
             colors.setdefault("accent", visual_colors[1])
 
-    typography = dict(theme_settings.get("typography") or {})
+    typography = dict(_ensure_mapping(theme_settings.get("typography"), field="theme_evidence.settings.typography"))
     if visual_fonts:
         typography.setdefault("body", visual_fonts[0])
         if len(visual_fonts) > 1:
@@ -169,7 +179,7 @@ def build_brand_package(
             "typography": typography,
             "logo_url": logo_url,
             "favicon_url": _first_str(visuals.get("favicon_url")),
-            "social_links": list(scrape.get("social_links") or []),
+            "social_links": _string_list(scrape.get("social_links"), field="scrape_evidence.social_links"),
             "voice": _first_str(manual.get("voice")),
         },
         "visual_identity": {
@@ -187,7 +197,7 @@ def build_brand_package(
         "evidence_summary": {
             "product_source": product_source,
             "visual_sources": visual_sources,
-            "api_product_count": len(api.get("products") or []),
+            "api_product_count": len(api_products),
             "stored_product_count": len(products),
         },
     }

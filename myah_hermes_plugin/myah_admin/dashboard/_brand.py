@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Any
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, ValidationError
 
 from ...brand_import.package_builder import build_brand_package
 from ...brand_import.source_adapters import BrandSourceEvidence, collect_brand_evidence
@@ -49,6 +49,41 @@ def _reject_oversized_start_payload(request: "BrandImportStartRequest") -> None:
             raise HTTPException(status_code=413, detail=f"brand import {key} exceeds {MAX_IMPORT_ITEMS} item limit")
 
 
+async def _read_limited_json_request(request: Request) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_IMPORT_TOTAL_BYTES:
+                raise HTTPException(status_code=413, detail="brand import payload too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid content length")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_IMPORT_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="brand import payload too large")
+        chunks.append(chunk)
+
+    try:
+        payload = json.loads(b"".join(chunks) or b"{}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="brand import payload must be an object")
+    return payload
+
+
+def _validate_start_request(payload: dict[str, Any]) -> "BrandImportStartRequest":
+    try:
+        if hasattr(BrandImportStartRequest, "model_validate"):
+            return BrandImportStartRequest.model_validate(payload)  # type: ignore[attr-defined]
+        return BrandImportStartRequest.parse_obj(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+
+
 class BrandImportStartRequest(BaseModel):
     shop_url: str | None = Field(default=None)
     connected_shopify: bool = False
@@ -70,9 +105,10 @@ async def brand_status(_auth: None = Depends(require_session_token)) -> dict[str
 
 @router.post("/import/start")
 async def start_brand_import(
-    request: BrandImportStartRequest,
+    raw_request: Request,
     _auth: None = Depends(require_session_token),
 ) -> dict[str, Any]:
+    request = _validate_start_request(await _read_limited_json_request(raw_request))
     _reject_oversized_start_payload(request)
     has_fixture_evidence = any(
         [
