@@ -104,6 +104,46 @@ def _parse_frontmatter(content: str) -> dict:
     return fm
 
 
+def _skill_summary_from_path(skill_md) -> dict[str, Any]:
+    """Return the list-skills summary shape for a local SKILL.md."""
+    content = skill_md.read_text(encoding='utf-8')
+    fm = _parse_frontmatter(content)
+    category = skill_md.parent.parent.name if skill_md.parent.parent.name != 'skills' else 'general'
+    if skill_md.parent.parent.parent.name == 'skills':
+        category = skill_md.parent.parent.name
+    name = fm.get('name') or skill_md.parent.name
+    description = fm.get('description') or ''
+    try:
+        last_synced_at = int(skill_md.stat().st_mtime)
+    except OSError:
+        last_synced_at = 0
+    return {
+        'id': '',
+        'user_id': '00000000-0000-0000-0000-000000000001',
+        'name': name,
+        'category': category,
+        'description': description,
+        'source': 'profile-local' if 'profiles' in skill_md.parts else 'local',
+        'trust': 'local',
+        'last_synced_at': last_synced_at,
+    }
+
+
+def _profile_local_skills() -> list[dict[str, Any]]:
+    """List profile-local skills so generated Brand Brain skills are visible."""
+    root = hermes_home_path()
+    profiles_dir = root / 'profiles'
+    if not profiles_dir.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for skill_md in sorted(profiles_dir.glob('*/skills/**/SKILL.md')):
+        try:
+            items.append(_skill_summary_from_path(skill_md))
+        except OSError as exc:
+            logger.warning('Skipping unreadable profile-local skill %s: %s', skill_md, exc)
+    return items
+
+
 async def _async_subprocess(*cmd: str, timeout: float = 10) -> tuple[int, str, str]:
     """Run a subprocess without blocking the event loop.
 
@@ -574,9 +614,13 @@ async def get_toolsets() -> list[dict]:
 
 @router.get('/skills')
 async def list_skills() -> list[dict]:
-    """Plugin-namespace mirror of GET /api/skills (web_server.py:2720).
-
-    Forwards via the loopback proxy so upstream's skill resolution stays
-    the source of truth.
-    """
-    return await proxy_to_native('GET', '/api/skills')
+    """List upstream skills plus profile-local skills created by Brand Import."""
+    upstream = await proxy_to_native('GET', '/api/skills')
+    if not isinstance(upstream, list):
+        return _profile_local_skills()
+    merged: list[dict[str, Any]] = [item for item in upstream if isinstance(item, dict)]
+    seen = {str(item.get('name')) for item in merged}
+    for item in _profile_local_skills():
+        if str(item.get('name')) not in seen:
+            merged.append(item)
+    return merged
