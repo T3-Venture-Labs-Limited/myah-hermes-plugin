@@ -397,6 +397,44 @@ def test_start_import_rejects_large_content_length_before_json_parse(monkeypatch
     assert response.json()["detail"] == "brand import payload too large"
 
 
+def test_start_import_rejects_non_digit_content_length(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/brand/import/start",
+        content=b'{"manual_evidence":{"brand_name":"Tiny"}}',
+        headers={"content-type": "application/json", "content-length": "1_0"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid content length"
+
+
+def test_start_import_rejects_empty_body(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/brand/import/start",
+        content=b"",
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "brand import payload must not be empty"
+
+
+def test_start_import_validation_detail_omits_pydantic_help_url(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/brand/import/start",
+        json={"public_product_urls": "https://bad.example/products/not-a-list"},
+    )
+
+    assert response.status_code == 422
+    assert all("url" not in error for error in response.json()["detail"])
+
+
 def test_brand_import_start_rejects_oversized_payloads(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
@@ -557,3 +595,22 @@ def test_status_surfaces_new_reimport_job_after_active_approval(monkeypatch, tmp
     assert status["status"] == "needs_review"
     assert status["current_job"]["job_id"] == second["job_id"]
     assert status["active"]["approved_job_id"] == first["job_id"]
+
+
+def test_status_preserves_active_brand_when_newest_job_is_corrupt(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    first = client.post(
+        "/brand/import/start",
+        json={"shop_url": "https://active.example", "manual_evidence": {"brand_name": "Active Brand"}},
+    ).json()
+    assert client.post("/brand/import/approve", json={"job_id": first["job_id"]}).status_code == 200
+
+    jobs_dir = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "jobs"
+    corrupt = jobs_dir / "brand-ffffffffffff.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    status = client.get("/brand/status").json()
+    assert status["status"] == "active"
+    assert status["active"]["approved_job_id"] == first["job_id"]
+    assert status["current_job"]["status"] == "failed"
+    assert status["current_job"]["error"] == "corrupt_brand_import_job"

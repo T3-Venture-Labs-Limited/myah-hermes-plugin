@@ -153,6 +153,8 @@ class BrandImportStore:
     def status(self) -> dict[str, Any]:
         active = self.active()
         job = self.latest_job()
+        if active and job and job.get("status") == "failed":
+            return {"status": "active", "active": active, "current_job": job}
         if job and job.get("status") != "active":
             return {"status": job.get("status", "unknown"), "active": active, "current_job": job}
         if active:

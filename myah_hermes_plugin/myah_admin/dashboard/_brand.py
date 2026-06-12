@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
@@ -52,11 +53,11 @@ def _reject_oversized_start_payload(request: "BrandImportStartRequest") -> None:
 async def _read_limited_json_request(request: Request) -> dict[str, Any]:
     content_length = request.headers.get("content-length")
     if content_length:
-        try:
-            if int(content_length) > MAX_IMPORT_TOTAL_BYTES:
-                raise HTTPException(status_code=413, detail="brand import payload too large")
-        except ValueError:
+        normalized_length = content_length.strip()
+        if not re.fullmatch(r"[0-9]+", normalized_length):
             raise HTTPException(status_code=400, detail="invalid content length")
+        if int(normalized_length) > MAX_IMPORT_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="brand import payload too large")
 
     chunks: list[bytes] = []
     total = 0
@@ -65,9 +66,11 @@ async def _read_limited_json_request(request: Request) -> dict[str, Any]:
         if total > MAX_IMPORT_TOTAL_BYTES:
             raise HTTPException(status_code=413, detail="brand import payload too large")
         chunks.append(chunk)
+    if total == 0:
+        raise HTTPException(status_code=400, detail="brand import payload must not be empty")
 
     try:
-        payload = json.loads(b"".join(chunks) or b"{}")
+        payload = json.loads(b"".join(chunks))
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     if not isinstance(payload, dict):
@@ -81,7 +84,11 @@ def _validate_start_request(payload: dict[str, Any]) -> "BrandImportStartRequest
             return BrandImportStartRequest.model_validate(payload)  # type: ignore[attr-defined]
         return BrandImportStartRequest.parse_obj(payload)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        try:
+            detail = exc.errors(include_url=False)
+        except TypeError:  # pydantic v1 fallback
+            detail = exc.errors()
+        raise HTTPException(status_code=422, detail=detail)
 
 
 class BrandImportStartRequest(BaseModel):
