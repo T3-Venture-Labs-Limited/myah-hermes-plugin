@@ -34,6 +34,26 @@ def _valid_job_id(job_id: str) -> bool:
     return bool(_JOB_ID_RE.fullmatch(job_id or ""))
 
 
+def approval_blockers(package: dict[str, Any]) -> list[str]:
+    """Return server-authoritative blockers that prevent Brand Brain approval."""
+    summary = package.get("evidence_summary") or {}
+    warnings = set(summary.get("warnings") or [])
+    blockers = sorted(warnings.intersection({"no_fixture_evidence", "connected_shopify_adapter_not_configured"}))
+    if blockers and (summary.get("stored_product_count") or 0) == 0 and not (summary.get("visual_sources") or []):
+        return blockers
+    return []
+
+
+def _annotate_approval_state(job: dict[str, Any]) -> dict[str, Any]:
+    """Attach approvable/approval_blockers without mutating persisted job files."""
+    package = job.get("package") if isinstance(job, dict) else None
+    blockers = approval_blockers(package or {}) if isinstance(package, dict) else []
+    annotated = {**job}
+    annotated["approval_blockers"] = blockers
+    annotated["approvable"] = not blockers and job.get("status") == "needs_review"
+    return annotated
+
+
 def _hermes_home() -> Path:
     from myah_hermes_plugin.myah_admin.dashboard._common import hermes_home_path
 
@@ -117,7 +137,7 @@ class BrandImportStore:
             "package": package,
         }
         _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
-        return job
+        return _annotate_approval_state(job)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         if not _valid_job_id(job_id):
@@ -154,11 +174,12 @@ class BrandImportStore:
         active = self.active()
         job = self.latest_job()
         if active and job and job.get("status") == "failed":
-            return {"status": "active", "active": active, "current_job": job}
+            return {"status": "active", "active": active, "current_job": _annotate_approval_state(job)}
         if job and job.get("status") != "active":
-            return {"status": job.get("status", "unknown"), "active": active, "current_job": job}
+            annotated_job = _annotate_approval_state(job)
+            return {"status": job.get("status", "unknown"), "active": active, "current_job": annotated_job}
         if active:
-            return {"status": "active", "active": active, "current_job": job}
+            return {"status": "active", "active": active, "current_job": _annotate_approval_state(job) if job else None}
         return {"status": "empty", "active": None, "current_job": None}
 
     def approve(self, job_id: str) -> dict[str, Any]:
@@ -166,13 +187,7 @@ class BrandImportStore:
         if not job:
             raise KeyError(job_id)
         package = job["package"]
-        summary = package.get("evidence_summary") or {}
-        warnings = set(summary.get("warnings") or [])
-        if (
-            warnings.intersection({"no_fixture_evidence", "connected_shopify_adapter_not_configured"})
-            and (summary.get("stored_product_count") or 0) == 0
-            and not (summary.get("visual_sources") or [])
-        ):
+        if approval_blockers(package):
             raise ValueError("brand import needs evidence before approval")
         self.write_brand_brain(package)
         self.write_brand_style_skill(package)

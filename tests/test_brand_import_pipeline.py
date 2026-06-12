@@ -16,6 +16,7 @@ from myah_hermes_plugin.myah_admin.dashboard import _brand
 from myah_hermes_plugin.brand_import.package_builder import build_brand_package
 from myah_hermes_plugin.brand_import.public_shopify import freeze_public_product_urls
 from myah_hermes_plugin.brand_import.source_adapters import BrandSourceEvidence
+from myah_hermes_plugin.brand_import.storage import BrandImportStore
 
 
 def _client(monkeypatch, tmp_path) -> TestClient:
@@ -454,7 +455,7 @@ def test_brand_import_start_rejects_oversized_payloads(monkeypatch, tmp_path):
     assert too_large_body.status_code in {400, 413, 422}
 
 
-def test_brand_import_without_fixture_evidence_surfaces_warning(monkeypatch, tmp_path):
+def test_url_only_public_fallback_fails_fast_until_scrape_light_exists(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
     response = client.post(
@@ -462,10 +463,19 @@ def test_brand_import_without_fixture_evidence_surfaces_warning(monkeypatch, tmp
         json={"shop_url": "https://empty.example", "connected_shopify": False},
     )
 
-    assert response.status_code == 200
-    summary = response.json()["package"]["evidence_summary"]
-    assert summary["product_source"] == "none"
-    assert "no_fixture_evidence" in summary["warnings"]
+    assert response.status_code == 400
+    assert "Storefront URL import is not available yet" in response.json()["detail"]
+    assert "manual brand details" in response.json()["detail"]
+
+
+def test_empty_brand_import_start_fails_fast_without_creating_dead_end(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post("/brand/import/start", json={})
+
+    assert response.status_code == 400
+    assert "manual brand details" in response.json()["detail"]
+    assert client.get("/brand/status").json()["status"] == "empty"
 
 
 def test_brand_brain_readme_sanitizes_client_shop_url(monkeypatch, tmp_path):
@@ -488,32 +498,48 @@ def test_brand_brain_readme_sanitizes_client_shop_url(monkeypatch, tmp_path):
     assert readme.count("---") == 0
 
 
-def test_approve_rejects_empty_no_evidence_draft(monkeypatch, tmp_path):
-    client = _client(monkeypatch, tmp_path)
-
-    start = client.post(
-        "/brand/import/start",
-        json={"shop_url": "https://empty.example", "connected_shopify": False},
+def test_store_marks_empty_no_evidence_draft_not_approvable(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "wiki"))
+    store = BrandImportStore()
+    job = store.create_review_job(
+        {
+            "brand": {"name": "Untitled brand"},
+            "products": [],
+            "visual_identity": {"colors": [], "fonts": []},
+            "evidence_summary": {
+                "warnings": ["no_fixture_evidence"],
+                "stored_product_count": 0,
+                "visual_sources": [],
+                "product_source": "none",
+            },
+        }
     )
-    assert start.status_code == 200
-    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
 
-    assert approve.status_code == 400
-    assert "needs evidence" in approve.json()["detail"]
+    status = store.status()
+    assert status["status"] == "needs_review"
+    assert status["current_job"]["approvable"] is False
+    assert status["current_job"]["approval_blockers"] == ["no_fixture_evidence"]
+
+    try:
+        store.approve(job["job_id"])
+    except ValueError as exc:
+        assert "needs evidence" in str(exc)
+    else:
+        raise AssertionError("empty no-evidence draft should not approve")
 
 
-def test_approve_rejects_empty_connected_adapter_draft(monkeypatch, tmp_path):
+def test_connected_mode_without_evidence_fails_fast_until_adapter_exists(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
     start = client.post(
         "/brand/import/start",
         json={"shop_url": "https://connected.example", "connected_shopify": True},
     )
-    assert start.status_code == 200
-    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
 
-    assert approve.status_code == 400
-    assert "needs evidence" in approve.json()["detail"]
+    assert start.status_code == 400
+    assert "Connected Shopify import is not available yet" in start.json()["detail"]
+    assert "manual brand details" in start.json()["detail"]
 
 
 def test_connected_mode_manual_evidence_can_be_approved(monkeypatch, tmp_path):

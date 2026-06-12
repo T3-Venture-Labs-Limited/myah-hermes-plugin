@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ...brand_import.package_builder import build_brand_package
 from ...brand_import.source_adapters import BrandSourceEvidence, collect_brand_evidence
-from ...brand_import.storage import BrandImportStore
+from ...brand_import.storage import BrandImportStore, approval_blockers
 from ._common import require_session_token
 
 router = APIRouter(prefix="/brand", tags=["brand-import"])
@@ -155,6 +155,13 @@ async def start_brand_import(
         raise HTTPException(status_code=400, detail=str(exc))
     if evidence.warnings:
         package.setdefault("evidence_summary", {}).setdefault("warnings", []).extend(evidence.warnings)
+    blockers = approval_blockers(package)
+    if blockers and not has_fixture_evidence:
+        if "connected_shopify_adapter_not_configured" in blockers:
+            detail = "Connected Shopify import is not available yet. Add manual brand details before starting Brand Import."
+        else:
+            detail = "Storefront URL import is not available yet. Add manual brand details or connect Shopify before starting Brand Import."
+        raise HTTPException(status_code=400, detail=detail)
     job = BrandImportStore().create_review_job(package)
     return {"job_id": job["job_id"], "status": job["status"], "package": package}
 
