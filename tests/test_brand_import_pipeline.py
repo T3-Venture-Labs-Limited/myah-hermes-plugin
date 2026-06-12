@@ -176,7 +176,16 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
             "connected_shopify": True,
             "api_evidence": {
                 "shop": {"name": "Glow Co", "primary_domain": "glow.example"},
-                "products": [{"title": "Serum", "handle": "serum", "images": [{"url": "https://cdn/serum.jpg"}]}],
+                "products": [
+                    {
+                        "title": "Serum",
+                        "handle": "serum",
+                        "description": "Hydrating lash serum for daily use.",
+                        "vendor": "Glow Co",
+                        "product_type": "Serum",
+                        "images": [{"url": "https://cdn/serum.jpg"}],
+                    }
+                ],
                 "pages": [{"title": "About", "body": "Clinically informed skincare."}],
             },
             "scrape_evidence": {"visuals": {"colors": ["#112233"], "fonts": ["Inter"]}},
@@ -213,10 +222,16 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
 
     wiki = tmp_path / "wiki"
     assert (wiki / "brand" / "README.md").read_text(encoding="utf-8").startswith("# Glow Co")
-    assert "Serum" in (wiki / "brand" / "products.md").read_text(encoding="utf-8")
-    assert "# Brand Style Guide" in (
+    products_md = (wiki / "brand" / "products.md").read_text(encoding="utf-8")
+    assert "Serum" in products_md
+    assert "Hydrating lash serum for daily use." in products_md
+    assert "Product type: Serum" in products_md
+    skill_md = (
         tmp_path / "hermes" / "profiles" / "creative-director" / "skills" / "brand-style-guide" / "SKILL.md"
     ).read_text(encoding="utf-8")
+    assert "# Brand Style Guide" in skill_md
+    assert "Hydrating lash serum" not in skill_md
+    assert "Product type: Serum" not in skill_md
 
     manifest = json.loads((tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "active"

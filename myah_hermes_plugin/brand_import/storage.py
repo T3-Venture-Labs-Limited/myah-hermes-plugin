@@ -270,6 +270,17 @@ class BrandImportStore:
                 products_lines.append(f"- URL: {_safe_text(product['url'], max_len=500)}")
             if product.get("handle"):
                 products_lines.append(f"- Handle: {_safe_text(product['handle'])}")
+            if product.get("product_type"):
+                products_lines.append(f"- Product type: {_safe_text(product['product_type'], max_len=160)}")
+            if product.get("vendor"):
+                products_lines.append(f"- Vendor: {_safe_text(product['vendor'], max_len=160)}")
+            if product.get("description"):
+                products_lines.append(f"- Description: {_safe_text(product['description'], max_len=1000)}")
+            tags = product.get("tags") or []
+            if tags:
+                safe_tags = [_safe_text(tag, max_len=80) for tag in tags if _safe_text(tag, max_len=80)]
+                if safe_tags:
+                    products_lines.append(f"- Tags: {', '.join(safe_tags)}")
             for image in product.get("image_urls") or []:
                 products_lines.append(f"- Image: {_safe_text(image, max_len=500)}")
             products_lines.append("")
