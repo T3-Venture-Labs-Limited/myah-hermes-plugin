@@ -777,11 +777,15 @@ class TestStreamHadContent:
         adapter = _make_adapter()
         stream_id = "s-test-interactive-threadsafe"
         adapter._streams[stream_id] = asyncio.Queue()
-        adapter._loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        try:
+            adapter._loop = loop
 
-        adapter._push_event(stream_id, {"event": "clarify.required", "ts": 0})
+            adapter._push_event(stream_id, {"event": "clarify.required", "ts": 0})
 
-        assert stream_id in adapter._stream_had_content
+            assert stream_id in adapter._stream_had_content
+        finally:
+            loop.close()
 
     def test_unknown_stream_id_does_not_explode(self):
         """If the stream_id is unknown (queue not present), _push_event_sync

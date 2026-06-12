@@ -22,7 +22,7 @@ requires-python = ">=3.11"
 # (Path B — git+https install in agent/Dockerfile.stock) to a strict semver
 # pin (Path A — `hermes-agent>=0.11,<0.12`). The plugin is 1.0.x as of
 # 2026-05-08; first release verified by Mode D against upstream commit
-# faa13e49f81480771ceeb55991bb0c27edf1a5fb (Hermes-Agent v0.11-track).
+# 955fa40062874faed1108f831864d29724a6250c (Hermes-Agent v0.11-track).
 #
 # OSS users today install via:
 #   pip install git+https://github.com/NousResearch/Hermes-Agent@<HERMES_SHA>
@@ -35,7 +35,7 @@ dependencies = [
     # won't conflict — pip respects already-installed compatible versions.
     # When hermes-agent reaches PyPI, this becomes "hermes-agent>=0.11,<0.12".
     # See CHANGELOG.md for the SHA verified against this plugin version.
-    "hermes-agent[messaging,cron,honcho,mcp,voice,pty,web] @ git+https://github.com/NousResearch/Hermes-Agent@faa13e49f81480771ceeb55991bb0c27edf1a5fb",
+    "hermes-agent[messaging,cron,honcho,mcp,voice,pty,web] @ git+https://github.com/NousResearch/Hermes-Agent@955fa40062874faed1108f831864d29724a6250c",
 ]
 
 [project.optional-dependencies]
