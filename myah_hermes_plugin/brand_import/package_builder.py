@@ -70,7 +70,7 @@ def _dict_list(value: Any, *, field: str) -> list[dict[str, Any]]:
     return out
 
 
-def _api_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _api_products(products: list[dict[str, Any]], *, source: str = "shopify_api") -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for index, product in enumerate(products[:100]):
         handle = _first_str(product.get("handle"))
@@ -86,7 +86,7 @@ def _api_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "product_type": _first_str(product.get("product_type"), product.get("productType")),
                 "tags": _tag_list(product.get("tags"), field=f"api_evidence.products[{index}].tags"),
                 "image_urls": _image_urls(product, field=f"api_evidence.products[{index}].images"),
-                "source": "shopify_api",
+                "source": source,
             }
         )
     return out
@@ -128,11 +128,23 @@ def build_brand_package(
     theme_settings = _ensure_mapping(theme.get("settings"), field="theme_evidence.settings")
 
     api_products = _dict_list(api.get("products"), field="api_evidence.products")
-    products = _api_products(api_products)
+    scrape_products = _dict_list(scrape.get("products"), field="scrape_evidence.products")
+    products = _api_products(api_products, source="shopify_api")
+    if not products and scrape_products:
+        products = _api_products(scrape_products, source="scraped_storefront")
     manual_has_evidence = any(
         manual.get(key) for key in ("visual_identity", "brand_name", "name", "voice", "shop")
     )
-    product_source = "shopify_api" if products else ("public_storefront" if public_product_urls else ("manual" if manual_has_evidence else "none"))
+    if api_products:
+        product_source = "shopify_api"
+    elif scrape_products:
+        product_source = "scraped_storefront"
+    elif public_product_urls:
+        product_source = "public_storefront"
+    elif manual_has_evidence:
+        product_source = "manual"
+    else:
+        product_source = "none"
     if not products:
         products = _public_products(public_product_urls or [])
 
@@ -170,7 +182,7 @@ def build_brand_package(
     return {
         "version": 1,
         "created_at": _now(),
-        "source_mode": "api_first" if api else "public_fallback",
+        "source_mode": "api_first" if api else ("scraped_storefront" if scrape else "manual" if manual_has_evidence else "public_fallback"),
         "shop_url": shop_url,
         "brand": {
             "name": _first_str(shop.get("name"), manual.get("brand_name"), manual.get("name")) or "Untitled brand",

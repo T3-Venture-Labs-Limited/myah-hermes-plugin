@@ -38,7 +38,7 @@ def approval_blockers(package: dict[str, Any]) -> list[str]:
     """Return server-authoritative blockers that prevent Brand Brain approval."""
     summary = package.get("evidence_summary") or {}
     warnings = set(summary.get("warnings") or [])
-    blockers = sorted(warnings.intersection({"no_fixture_evidence", "connected_shopify_adapter_not_configured"}))
+    blockers = sorted(warnings.intersection({"no_fixture_evidence", "no_public_storefront_evidence", "connected_shopify_adapter_not_configured"}))
     if blockers and (summary.get("stored_product_count") or 0) == 0 and not (summary.get("visual_sources") or []):
         return blockers
     return []

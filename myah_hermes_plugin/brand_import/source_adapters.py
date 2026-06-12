@@ -26,6 +26,17 @@ class BrandSourceAdapter(Protocol):
         """Collect evidence for a single Brand Import run."""
 
 
+class PublicStorefrontScrapeAdapter:
+    """Scrape a public storefront URL without Shopify/Composio auth."""
+
+    def collect(self, shop_url: str, *, fixture: BrandSourceEvidence | None = None) -> BrandSourceEvidence:
+        if fixture:
+            return fixture
+        from .public_shopify import scrape_public_storefront
+
+        return scrape_public_storefront(shop_url)
+
+
 class FixtureBrandSourceAdapter:
     """Adapter used by tests and local smoke paths.
 
@@ -62,8 +73,5 @@ def collect_brand_evidence(
 ) -> BrandSourceEvidence:
     """Collect source evidence through the deterministic adapter seam."""
 
-    if connected_shopify:
-        adapter = connected_adapter or MissingConnectedShopifyAdapter()
-    else:
-        adapter = fallback_adapter or FixtureBrandSourceAdapter()
+    adapter = fallback_adapter or PublicStorefrontScrapeAdapter()
     return adapter.collect(shop_url, fixture=fixture)

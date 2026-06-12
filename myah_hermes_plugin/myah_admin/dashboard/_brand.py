@@ -7,6 +7,7 @@ proxy to these routes rather than writing `/data/.hermes` directly.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 import json
 import re
@@ -93,7 +94,7 @@ def _validate_start_request(payload: dict[str, Any]) -> "BrandImportStartRequest
 
 class BrandImportStartRequest(BaseModel):
     shop_url: str | None = Field(default=None)
-    connected_shopify: bool = False
+    connected_shopify: bool = False  # accepted for backwards compatibility; Brand Import is scrape-first.
     api_evidence: dict[str, Any] | None = None
     theme_evidence: dict[str, Any] | None = None
     scrape_evidence: dict[str, Any] | None = None
@@ -126,6 +127,8 @@ async def start_brand_import(
             request.public_product_urls,
         ]
     )
+    if not has_fixture_evidence and not (request.shop_url or "").strip():
+        raise HTTPException(status_code=400, detail="Enter a storefront URL to import your brand.")
     fixture = (
         BrandSourceEvidence(
             api_evidence=request.api_evidence,
@@ -137,12 +140,13 @@ async def start_brand_import(
         if has_fixture_evidence
         else None
     )
-    evidence = collect_brand_evidence(
-        request.shop_url or "",
-        connected_shopify=request.connected_shopify,
-        fixture=fixture,
-    )
     try:
+        evidence = await asyncio.to_thread(
+            collect_brand_evidence,
+            request.shop_url or "",
+            connected_shopify=request.connected_shopify,
+            fixture=fixture,
+        )
         package = build_brand_package(
             shop_url=request.shop_url,
             api_evidence=evidence.api_evidence,
@@ -156,12 +160,16 @@ async def start_brand_import(
     if evidence.warnings:
         package.setdefault("evidence_summary", {}).setdefault("warnings", []).extend(evidence.warnings)
     blockers = approval_blockers(package)
+    if not has_fixture_evidence and ("no_public_storefront_evidence" in evidence.warnings or "storefront_fetch_failed" in ";".join(evidence.warnings)):
+        raise HTTPException(
+            status_code=400,
+            detail="We could not collect enough public brand evidence from that URL. Check the storefront URL and try again.",
+        )
     if blockers and not has_fixture_evidence:
-        if "connected_shopify_adapter_not_configured" in blockers:
-            detail = "Connected Shopify import is not available yet. Add manual brand details before starting Brand Import."
-        else:
-            detail = "Storefront URL import is not available yet. Add manual brand details or connect Shopify before starting Brand Import."
-        raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(
+            status_code=400,
+            detail="We could not collect enough public brand evidence from that URL. Check the storefront URL and try again.",
+        )
     job = BrandImportStore().create_review_job(package)
     return {"job_id": job["job_id"], "status": job["status"], "package": package}
 

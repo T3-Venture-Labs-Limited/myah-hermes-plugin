@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from myah_hermes_plugin.myah_admin.dashboard import _brand
 from myah_hermes_plugin.brand_import.package_builder import build_brand_package
-from myah_hermes_plugin.brand_import.public_shopify import freeze_public_product_urls
+from myah_hermes_plugin.brand_import.public_shopify import freeze_public_product_urls, scrape_public_storefront
 from myah_hermes_plugin.brand_import.source_adapters import BrandSourceEvidence
 from myah_hermes_plugin.brand_import.storage import BrandImportStore
 
@@ -71,6 +71,99 @@ def test_freeze_public_product_urls_caps_first_100_before_enrichment():
     assert frozen[0].endswith("item-0")
     assert frozen[-1].endswith("item-99")
     assert all("item-100" not in url for url in frozen)
+
+
+def test_public_storefront_scraper_collects_products_brand_and_visuals_without_shopify_auth():
+    responses = {
+        "https://glow.test": b'''<!doctype html><html><head>
+            <title>Glow Test | Premium lash care</title>
+            <meta property="og:site_name" content="Glow Test">
+            <meta property="og:image" content="/cdn/logo.png">
+            <link rel="icon" href="/favicon.ico">
+            <style>:root{--brand:#111111;color:#F7E7CE;font-family:'Instrument Serif', Inter, sans-serif;}</style>
+            </head><body><a href="https://instagram.com/glowtest">Instagram</a></body></html>''',
+        "https://glow.test/products.json?limit=100": json.dumps(
+            {
+                "products": [
+                    {
+                        "id": 1,
+                        "title": "Lash Serum",
+                        "handle": "lash-serum",
+                        "body_html": "<p>Grow healthier lashes.</p>",
+                        "vendor": "Glow Test",
+                        "product_type": "Serum",
+                        "tags": ["lashes", "serum"],
+                        "images": [{"src": "https://cdn.test/serum.jpg"}],
+                    }
+                ]
+            }
+        ).encode(),
+    }
+
+    def fetch(url):
+        return responses[url]
+
+    evidence = scrape_public_storefront("glow.test", fetch=fetch)
+
+    assert evidence.scrape_evidence["shop"]["name"] == "Glow Test"
+    assert evidence.scrape_evidence["visuals"]["logo_url"] == "https://glow.test/cdn/logo.png"
+    assert evidence.scrape_evidence["visuals"]["favicon_url"] == "https://glow.test/favicon.ico"
+    assert "#111111" in evidence.scrape_evidence["visuals"]["colors"]
+    assert "Instrument Serif" in evidence.scrape_evidence["visuals"]["fonts"]
+    assert evidence.scrape_evidence["social_links"] == ["https://instagram.com/glowtest"]
+    assert evidence.scrape_evidence["products"][0]["title"] == "Lash Serum"
+    assert evidence.scrape_evidence["products"][0]["description"] == "Grow healthier lashes."
+    assert evidence.public_product_urls == ["https://glow.test/products/lash-serum"]
+    assert evidence.warnings == []
+
+
+def test_public_storefront_scraper_uses_origin_root_for_products_json_when_url_has_path():
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        if url == "https://glow.test/collections/all":
+            return b"<html><head><title>Glow Test</title></head></html>"
+        if url == "https://glow.test/products.json?limit=100":
+            return json.dumps({"products": [{"title": "Root Product", "handle": "root-product"}]}).encode()
+        raise AssertionError(url)
+
+    evidence = scrape_public_storefront("https://glow.test/collections/all", fetch=fetch)
+
+    assert seen == ["https://glow.test/collections/all", "https://glow.test/products.json?limit=100"]
+    assert evidence.scrape_evidence["products"][0]["url"] == "https://glow.test/products/root-product"
+
+
+def test_public_storefront_scraper_rejects_private_network_urls():
+    evidence = scrape_public_storefront("http://127.0.0.1")
+
+    assert any("storefront_fetch_failed" in warning for warning in evidence.warnings)
+
+
+def test_url_only_start_uses_public_scraper_instead_of_manual_or_composio(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        _brand,
+        "collect_brand_evidence",
+        lambda shop_url, **_kwargs: BrandSourceEvidence(
+            scrape_evidence={
+                "shop": {"name": "Scraped Brand", "domain": shop_url},
+                "visuals": {"colors": ["#111111"], "fonts": ["Inter"]},
+                "products": [{"title": "Scraped Product", "url": f"{shop_url}/products/scraped-product"}],
+            },
+            public_product_urls=["https://scraped.example/products/scraped-product"],
+        ),
+    )
+
+    response = client.post("/brand/import/start", json={"shop_url": "https://scraped.example"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["package"]["source_mode"] == "scraped_storefront"
+    assert body["package"]["brand"]["name"] == "Scraped Brand"
+    assert body["package"]["products"][0]["title"] == "Scraped Product"
+    assert body["package"]["evidence_summary"]["product_source"] == "scraped_storefront"
 
 
 def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, tmp_path):
@@ -172,7 +265,7 @@ def test_brand_import_start_falls_back_to_public_scrape_package(monkeypatch, tmp
 
     assert response.status_code == 200
     package = response.json()["package"]
-    assert package["source_mode"] == "public_fallback"
+    assert package["source_mode"] == "scraped_storefront"
     assert package["brand"]["name"] == "Fallback Brand"
     assert len(package["products"] ) == 100
     assert package["products"][-1]["url"].endswith("/99")
@@ -455,17 +548,22 @@ def test_brand_import_start_rejects_oversized_payloads(monkeypatch, tmp_path):
     assert too_large_body.status_code in {400, 413, 422}
 
 
-def test_url_only_public_fallback_fails_fast_until_scrape_light_exists(monkeypatch, tmp_path):
+def test_public_scrape_failure_fails_fast_without_dead_end_job(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        _brand,
+        "collect_brand_evidence",
+        lambda *_args, **_kwargs: BrandSourceEvidence(warnings=["storefront_fetch_failed:HTTPError"]),
+    )
 
     response = client.post(
         "/brand/import/start",
-        json={"shop_url": "https://empty.example", "connected_shopify": False},
+        json={"shop_url": "https://empty.example"},
     )
 
     assert response.status_code == 400
-    assert "Storefront URL import is not available yet" in response.json()["detail"]
-    assert "manual brand details" in response.json()["detail"]
+    assert "could not collect enough public brand evidence" in response.json()["detail"].lower()
+    assert client.get("/brand/status").json()["status"] == "empty"
 
 
 def test_empty_brand_import_start_fails_fast_without_creating_dead_end(monkeypatch, tmp_path):
@@ -474,7 +572,17 @@ def test_empty_brand_import_start_fails_fast_without_creating_dead_end(monkeypat
     response = client.post("/brand/import/start", json={})
 
     assert response.status_code == 400
-    assert "manual brand details" in response.json()["detail"]
+    assert "storefront URL" in response.json()["detail"]
+    assert client.get("/brand/status").json()["status"] == "empty"
+
+
+def test_malformed_brand_import_url_returns_400_instead_of_500(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    response = client.post("/brand/import/start", json={"shop_url": "ftp://example.com"})
+
+    assert response.status_code == 400
+    assert "valid public storefront URL" in response.json()["detail"]
     assert client.get("/brand/status").json()["status"] == "empty"
 
 
@@ -529,17 +637,23 @@ def test_store_marks_empty_no_evidence_draft_not_approvable(monkeypatch, tmp_pat
         raise AssertionError("empty no-evidence draft should not approve")
 
 
-def test_connected_mode_without_evidence_fails_fast_until_adapter_exists(monkeypatch, tmp_path):
+def test_connected_shopify_flag_is_ignored_because_brand_import_is_scrape_first(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        _brand,
+        "collect_brand_evidence",
+        lambda shop_url, **_kwargs: BrandSourceEvidence(
+            scrape_evidence={"shop": {"name": "Connected Ignored Brand"}, "products": [{"title": "Scraped"}]}
+        ),
+    )
 
     start = client.post(
         "/brand/import/start",
         json={"shop_url": "https://connected.example", "connected_shopify": True},
     )
 
-    assert start.status_code == 400
-    assert "Connected Shopify import is not available yet" in start.json()["detail"]
-    assert "manual brand details" in start.json()["detail"]
+    assert start.status_code == 200
+    assert start.json()["package"]["brand"]["name"] == "Connected Ignored Brand"
 
 
 def test_connected_mode_manual_evidence_can_be_approved(monkeypatch, tmp_path):
