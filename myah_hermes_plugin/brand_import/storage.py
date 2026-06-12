@@ -139,6 +139,43 @@ class BrandImportStore:
         _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
         return _annotate_approval_state(job)
 
+    def override_review_job(self, job_id: str, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Apply user-supplied review overrides before approval."""
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        if job.get("status") != "needs_review":
+            raise ValueError("brand import overrides can only be applied before approval")
+        package = job.get("package")
+        if not isinstance(package, dict):
+            raise ValueError("brand import job is missing a package")
+        brand = package.setdefault("brand", {})
+        if not isinstance(brand, dict):
+            raise ValueError("brand import package has invalid brand data")
+        manual = package.setdefault("manual_overrides", {})
+        if not isinstance(manual, dict):
+            manual = {}
+            package["manual_overrides"] = manual
+        if overrides.get("logo_data_url"):
+            logo_data_url = str(overrides["logo_data_url"])
+            if not logo_data_url.startswith("data:image/") or len(logo_data_url) > 2_000_000:
+                raise ValueError("uploaded logo must be an image under 2MB")
+            brand["logo_url"] = logo_data_url
+            manual["logo_filename"] = _safe_text(overrides.get("logo_filename"), max_len=240)
+            manual["logo_source"] = "uploaded"
+        elif overrides.get("logo_url"):
+            brand["logo_url"] = _safe_text(overrides.get("logo_url"), max_len=1000)
+            manual["logo_source"] = "manual_url"
+        if isinstance(overrides.get("typography"), dict):
+            brand["typography"] = {str(k): _safe_text(v, max_len=120) for k, v in overrides["typography"].items() if v}
+            manual["typography"] = True
+        if isinstance(overrides.get("colors"), dict):
+            brand["colors"] = {str(k): _safe_text(v, max_len=40) for k, v in overrides["colors"].items() if v}
+            manual["colors"] = True
+        job["updated_at"] = _utc_now()
+        _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
+        return _annotate_approval_state(job)
+
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         if not _valid_job_id(job_id):
             raise ValueError("invalid brand import job id")

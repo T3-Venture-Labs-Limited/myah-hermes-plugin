@@ -193,6 +193,20 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert status.json()["current_job"]["job_id"] == job_id
     assert status.json()["current_job"]["package"]["brand"]["name"] == "Glow Co"
 
+    override = client.post(
+        "/brand/import/override",
+        json={
+            "job_id": job_id,
+            "logo_data_url": "data:image/png;base64,ZmFrZQ==",
+            "logo_filename": "approved-logo.png",
+            "typography": {"body": "Lato", "heading": "Playfair"},
+        },
+    )
+    assert override.status_code == 200
+    assert override.json()["package"]["brand"]["logo_url"] == "data:image/png;base64,ZmFrZQ=="
+    assert override.json()["package"]["brand"]["typography"]["body"] == "Lato"
+    assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
+
     approve = client.post("/brand/import/approve", json={"job_id": job_id})
     assert approve.status_code == 200
     assert approve.json()["status"] == "active"

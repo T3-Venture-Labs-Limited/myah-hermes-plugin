@@ -105,6 +105,14 @@ class BrandImportStartRequest(BaseModel):
 class BrandImportApproveRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
 
+class BrandImportOverrideRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+    logo_data_url: str | None = None
+    logo_filename: str | None = None
+    logo_url: str | None = None
+    typography: dict[str, Any] | None = None
+    colors: dict[str, Any] | None = None
+
 
 @router.get("/status")
 async def brand_status(_auth: None = Depends(require_session_token)) -> dict[str, Any]:
@@ -172,6 +180,21 @@ async def start_brand_import(
         )
     job = BrandImportStore().create_review_job(package)
     return {"job_id": job["job_id"], "status": job["status"], "package": package}
+
+
+@router.post("/import/override")
+async def override_brand_import(
+    request: BrandImportOverrideRequest,
+    _auth: None = Depends(require_session_token),
+) -> dict[str, Any]:
+    overrides = _request_payload(request)
+    overrides.pop("job_id", None)
+    try:
+        return BrandImportStore().override_review_job(request.job_id, overrides)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="brand import job not found")
 
 
 @router.post("/import/approve")

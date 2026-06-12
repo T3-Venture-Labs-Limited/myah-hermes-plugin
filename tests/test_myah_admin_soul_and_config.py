@@ -262,6 +262,41 @@ def test_get_commands_returns_list(client):
     assert {"ping", "help"}.issubset(names)
 
 
+def test_get_commands_includes_requested_profile_local_skills(client, hermes_home):
+    tc, mod = client
+    mod._commands_cache["value"] = None
+    mod._commands_cache["expires_at"] = 0.0
+    mod._commands_cache["profile_id"] = None
+
+    skill_dir = hermes_home / "profiles" / "creative-director" / "skills" / "brand-style-guide"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: brand-style-guide\ndescription: Profile-local Brand Brain command\n---\n# Brand\n",
+        encoding="utf-8",
+    )
+    fake_modules = {
+        "hermes_cli.commands": type(
+            "M",
+            (),
+            {"COMMAND_REGISTRY": [], "ACTIVE_SESSION_BYPASS_COMMANDS": frozenset()},
+        ),
+        "agent.skill_commands": type("M", (), {"get_skill_commands": lambda: {}}),
+        "hermes_cli.plugins": type("M", (), {"get_plugin_commands": lambda: {}}),
+    }
+
+    with patch.dict("sys.modules", fake_modules):
+        resp = tc.get("/commands?profile_id=creative-director")
+
+    assert resp.status_code == 200
+    commands = resp.json()["commands"]
+    assert any(
+        command["name"] == "brand-style-guide"
+        and command["profile_id"] == "creative-director"
+        and command["skill_path"].endswith("brand-style-guide")
+        for command in commands
+    )
+
+
 # ── /config/reset ───────────────────────────────────────────────────────────
 
 

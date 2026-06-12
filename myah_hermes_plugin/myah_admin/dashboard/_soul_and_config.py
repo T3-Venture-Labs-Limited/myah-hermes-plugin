@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Path as PathParam,
+    Query,
     Request,
     Response,
     status,
@@ -237,12 +239,68 @@ async def get_aux_resolved(
 # legacy aiohttp version recomputed on every call (no cache). 60s matches
 # what a `functools.lru_cache(maxsize=1)`-with-TTL would give us, without
 # pulling in a TTL cache library.
-_commands_cache: dict[str, Any] = {"value": None, "expires_at": 0.0}
+_commands_cache: dict[str, Any] = {"value": None, "expires_at": 0.0, "profile_id": None}
 _commands_cache_lock = threading.Lock()
 _COMMANDS_CACHE_TTL_SECONDS = 60.0
 
 
-def _build_commands_payload() -> dict[str, list[dict[str, Any]]]:
+def _normalize_commands_profile_id(profile_id: str | None) -> str:
+    value = (profile_id or "default").strip().lower() or "default"
+    if not re.match(r"^[a-z0-9_-]+$", value):
+        return "default"
+    return value
+
+
+def _profile_skill_command_items(profile_id: str) -> list[dict[str, Any]]:
+    """Return slash-command entries from ~/.hermes/profiles/<id>/skills."""
+    if profile_id == "default":
+        return []
+    skills_dir = hermes_home_path() / "profiles" / profile_id / "skills"
+    if not skills_dir.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for skill_md in sorted(skills_dir.glob("**/SKILL.md")):
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+            frontmatter: dict[str, Any] = {}
+            if content.startswith("---"):
+                _, fm, body = content.split("---", 2)
+                frontmatter = yaml.safe_load(fm) or {}
+            else:
+                body = content
+            name = str(frontmatter.get("name") or skill_md.parent.name).strip()
+            if not name or name in seen:
+                continue
+            description = str(frontmatter.get("description") or "").strip()
+            if not description:
+                for line in body.strip().split("\n"):
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        description = line[:120]
+                        break
+            cmd_name = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-").replace("_", "-"))
+            cmd_name = re.sub(r"-+", "-", cmd_name).strip("-")
+            if not cmd_name:
+                continue
+            seen.add(name)
+            items.append({
+                "name": name,
+                "category": "skill",
+                "description": description or f"Invoke the {name} skill",
+                "aliases": [],
+                "args": "",
+                "bypass": False,
+                "source": "skill",
+                "skill_path": str(skill_md.parent),
+                "profile_id": profile_id,
+            })
+        except Exception:
+            logger.exception("[myah-admin] failed to collect profile skill command from %s", skill_md)
+    return items
+
+
+def _build_commands_payload(profile_id: str = "default") -> dict[str, list[dict[str, Any]]]:
     """Collect commands from builtin registry + skills + plugins."""
     items: list[dict[str, Any]] = []
 
@@ -284,6 +342,11 @@ def _build_commands_payload() -> dict[str, list[dict[str, Any]]]:
     except Exception:
         logger.exception("[myah-admin] failed to collect skill commands")
 
+    existing_skill_paths = {item.get("skill_path") for item in items if item.get("source") == "skill"}
+    for item in _profile_skill_command_items(profile_id):
+        if item.get("skill_path") not in existing_skill_paths:
+            items.append(item)
+
     # 3. Plugin commands
     try:
         from hermes_cli.plugins import get_plugin_commands
@@ -305,21 +368,27 @@ def _build_commands_payload() -> dict[str, list[dict[str, Any]]]:
 
 @router.get("/commands")
 async def list_commands(
+    profile_id: str | None = Query(default=None),
     _auth: None = Depends(require_session_token),
 ) -> dict[str, Any]:
-    """List all chat-available slash commands (builtins + skills + plugins).
+    """List chat-available slash commands, including selected profile skills.
 
     Result is cached in-memory for 60s to avoid repeated filesystem scans on
-    skills/plugin discovery. Cache is per-process; restart the dashboard
-    process to bust it on demand (or wait 60s).
+    skills/plugin discovery. Cache is per-process and keyed by profile id.
     """
+    normalized_profile = _normalize_commands_profile_id(profile_id)
     now = time.monotonic()
     with _commands_cache_lock:
-        if _commands_cache["value"] is not None and now < _commands_cache["expires_at"]:
+        if (
+            _commands_cache["value"] is not None
+            and _commands_cache.get("profile_id") == normalized_profile
+            and now < _commands_cache["expires_at"]
+        ):
             return _commands_cache["value"]
-    payload = _build_commands_payload()
+    payload = _build_commands_payload(normalized_profile)
     with _commands_cache_lock:
         _commands_cache["value"] = payload
+        _commands_cache["profile_id"] = normalized_profile
         _commands_cache["expires_at"] = now + _COMMANDS_CACHE_TTL_SECONDS
     return payload
 
