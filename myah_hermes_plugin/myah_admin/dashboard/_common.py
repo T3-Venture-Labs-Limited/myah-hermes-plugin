@@ -44,16 +44,35 @@ logger = logging.getLogger(__name__)
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 _SESSION_TOKEN_ENV = "HERMES_WEB_SESSION_TOKEN"
-
+_SESSION_TOKEN_FALLBACK_ENVS = (
+    "MYAH_HERMES_WEB_SESSION_TOKEN",
+    "HERMES_DASHBOARD_SESSION_TOKEN",
+)
 
 def _get_session_token() -> str | None:
     """The shared secret the dashboard process expects.
 
     Read at request time (not module load) so tests can override via
-    ``monkeypatch.setenv`` without re-importing the module.
+    ``monkeypatch.setenv`` without re-importing the module. Local OSS
+    worktree smoke runs sometimes carry the token under the platform-side
+    ``MYAH_HERMES_WEB_SESSION_TOKEN`` or the upstream dashboard-side
+    ``HERMES_DASHBOARD_SESSION_TOKEN`` name, so accept those as fallbacks.
     """
-    token = os.environ.get(_SESSION_TOKEN_ENV)
-    return token or None
+    explicit = os.environ.get(_SESSION_TOKEN_ENV, "").strip()
+    if explicit:
+        return explicit
+    # In local OSS smoke runs the upstream dashboard middleware is already
+    # gated by HERMES_DASHBOARD_SESSION_TOKEN. Avoid a second plugin-level
+    # token check because the platform keeps the shared value under the
+    # MYAH_* name and the dashboard process may not mirror it into the legacy
+    # HERMES_WEB_SESSION_TOKEN name.
+    if os.environ.get("MYAH_DEPLOYMENT_MODE", "").strip().lower() == "oss":
+        return None
+    for env_name in _SESSION_TOKEN_FALLBACK_ENVS:
+        token = os.environ.get(env_name, "").strip()
+        if token:
+            return token
+    return None
 
 
 async def require_session_token(
