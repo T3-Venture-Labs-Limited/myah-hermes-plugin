@@ -19,22 +19,6 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
-def _image_urls(product: dict[str, Any], *, field: str) -> list[str]:
-    urls: list[str] = []
-    for raw_url in _string_list(product.get("image_urls"), field=f"{field}.image_urls"):
-        urls.append(raw_url)
-    for index, image in enumerate(_ensure_list(product.get("images"), field=field)):
-        if isinstance(image, dict):
-            url = _first_str(image.get("url"), image.get("src"), image.get("originalSrc"))
-        elif isinstance(image, str):
-            url = _first_str(image)
-        else:
-            raise ValueError(f"invalid {field}[{index}]: expected object or string")
-        if url:
-            urls.append(url)
-    return list(dict.fromkeys(urls))
-
-
 def _ensure_mapping(value: Any, *, field: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -87,7 +71,6 @@ def _api_products(products: list[dict[str, Any]], *, source: str = "shopify_api"
                 "vendor": _first_str(product.get("vendor")),
                 "product_type": _first_str(product.get("product_type"), product.get("productType")),
                 "tags": _tag_list(product.get("tags"), field=f"api_evidence.products[{index}].tags"),
-                "image_urls": _image_urls(product, field=f"api_evidence.products[{index}].images"),
                 "source": source,
             }
         )

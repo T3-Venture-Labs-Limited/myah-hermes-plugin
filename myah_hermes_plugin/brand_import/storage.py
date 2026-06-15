@@ -36,11 +36,8 @@ _FONT_EXTENSIONS = {
     "font/otf": ".otf",
 }
 _MAX_LOGO_BYTES = 5_000_000
-_MAX_PRODUCT_IMAGE_BYTES = 8_000_000
 _MAX_FONT_BYTES = 3_000_000
 _MAX_APPROVAL_FONT_ASSETS = 4
-_MAX_APPROVAL_PRODUCT_IMAGE_ASSETS = 24
-_MAX_APPROVAL_IMAGES_PER_PRODUCT = 1
 _MAX_SAFE_TEXT = 120
 logger = logging.getLogger(__name__)
 
@@ -122,6 +119,25 @@ def _is_brand_asset_ref(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("brand/assets/") and ".." not in value.split("/")
 
 
+def _safe_file_asset_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().strip("/" )
+    if not text.startswith("brand/assets/"):
+        return None
+    if any(part in {"", ".", ".."} for part in text.split("/")):
+        return None
+    return text
+
+
+def _asset_path_from_record(record: Any) -> str | None:
+    if isinstance(record, str):
+        return _safe_file_asset_path(record)
+    if isinstance(record, dict):
+        return _safe_file_asset_path(record.get("path"))
+    return None
+
+
 def _fetch_public_asset(url: str, *, max_bytes: int) -> tuple[bytes, str]:
     from .public_shopify import _validate_public_fetch_url
 
@@ -189,12 +205,6 @@ def _safe_product(product: Any) -> dict[str, Any] | None:
     tags = _safe_list(product.get("tags"), max_items=20, max_len=80)
     if tags:
         cleaned["tags"] = tags
-    image_urls = _safe_list(product.get("image_urls"), max_items=8, max_len=500)
-    if image_urls:
-        cleaned["image_urls"] = image_urls
-    image_assets = _safe_list(product.get("image_assets"), max_items=8, max_len=500)
-    if image_assets:
-        cleaned["image_assets"] = image_assets
     return cleaned
 
 
@@ -350,101 +360,45 @@ class BrandImportStore:
         return logo_file
 
     def _materialize_brand_assets(self, package: dict[str, Any], brand_dir: Path) -> dict[str, Any]:
+        """Apply File Explorer asset refs to the package.
+
+        Brand Import no longer stores binary logo/font/product-image assets under
+        WIKI_PATH. The platform owns File Explorer storage and passes logical
+        `brand/assets/...` refs during approval. The wiki only records those
+        paths. Product images are intentionally not downloaded or persisted;
+        future generation skills should use product URLs from `brand/products.md`
+        to fetch live source context when needed.
+        """
         brand = package.setdefault("brand", {})
         visual_identity = package.setdefault("visual_identity", {})
         if not isinstance(brand, dict) or not isinstance(visual_identity, dict):
             return {"logo": None, "fonts": [], "product_images": {}}
 
-        assets_dir = brand_dir / "assets"
         result: dict[str, Any] = {"logo": None, "fonts": [], "product_images": {}}
+        file_assets = package.get("file_assets") if isinstance(package.get("file_assets"), dict) else {}
 
-        logo_ref = self._materialize_logo_if_needed(package)
-        if logo_ref:
-            try:
-                if _is_brand_asset_ref(logo_ref):
-                    logo_asset = logo_ref
-                else:
-                    if _is_public_asset_url(logo_ref):
-                        logo_file = _write_remote_asset(
-                            logo_ref,
-                            assets_dir,
-                            fallback_name="brand-logo",
-                            allowed=_IMAGE_EXTENSIONS,
-                            max_bytes=_MAX_LOGO_BYTES,
-                            fallback_ext=".png",
-                        )
-                    else:
-                        source = Path(logo_ref)
-                        if not source.exists() or not source.is_file():
-                            raise FileNotFoundError(str(source))
-                        target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix or ".png")
-                        assets_dir.mkdir(parents=True, exist_ok=True)
-                        if source.resolve() != target.resolve():
-                            shutil.copyfile(source, target)
-                        logo_file = str(target)
-                    logo_asset = f"brand/assets/{Path(logo_file).name}"
-                brand["logo_url"] = logo_asset
-                visual_identity["logo_url"] = logo_asset
-                result["logo"] = logo_asset
-            except Exception as exc:
-                logger.warning("Could not materialize Brand Import logo asset %s: %s", logo_ref, exc)
+        logo_asset = _asset_path_from_record(file_assets.get("logo"))
+        if not logo_asset:
+            logo_asset = _safe_file_asset_path(brand.get("logo_url") or visual_identity.get("logo_url"))
+        if logo_asset:
+            brand["logo_url"] = logo_asset
+            visual_identity["logo_url"] = logo_asset
+            result["logo"] = logo_asset
 
         font_assets: list[str] = []
-        for index, font_url in enumerate(_safe_list(visual_identity.get("font_urls"), max_items=_MAX_APPROVAL_FONT_ASSETS, max_len=1000)):
-            if not _is_public_asset_url(font_url):
-                continue
-            try:
-                font_file = _write_remote_asset(
-                    font_url,
-                    assets_dir / "fonts",
-                    fallback_name=f"font-{index + 1}",
-                    allowed=_FONT_EXTENSIONS,
-                    max_bytes=_MAX_FONT_BYTES,
-                    fallback_ext=".woff2",
-                )
-                font_assets.append(f"brand/assets/fonts/{Path(font_file).name}")
-            except Exception as exc:
-                logger.warning("Could not materialize Brand Import font asset %s: %s", font_url, exc)
+        for record in (file_assets.get("fonts") or [])[:_MAX_APPROVAL_FONT_ASSETS]:
+            path = _asset_path_from_record(record)
+            if path:
+                font_assets.append(path)
         if font_assets:
             visual_identity["font_assets"] = font_assets
             result["fonts"] = font_assets
 
-        product_image_assets: dict[int, list[str]] = {}
         products = package.get("products") if isinstance(package.get("products"), list) else []
-        downloaded_product_images = 0
-        for product_index, product in enumerate(products):
-            if not isinstance(product, dict):
-                continue
-            if downloaded_product_images >= _MAX_APPROVAL_PRODUCT_IMAGE_ASSETS:
-                break
-            handle = _safe_text(product.get("handle"), max_len=160)
-            title = _safe_text(product.get("title"), max_len=160) or f"product-{product_index + 1}"
-            slug = _safe_filename(handle or title.lower().replace(" ", "-"), fallback=f"product-{product_index + 1}")
-            assets: list[str] = []
-            for image_index, image_url in enumerate(
-                _safe_list(product.get("image_urls"), max_items=_MAX_APPROVAL_IMAGES_PER_PRODUCT, max_len=1000)
-            ):
-                if downloaded_product_images >= _MAX_APPROVAL_PRODUCT_IMAGE_ASSETS:
-                    break
-                if not _is_public_asset_url(image_url):
-                    continue
-                try:
-                    image_file = _write_remote_asset(
-                        image_url,
-                        assets_dir / "products" / slug,
-                        fallback_name=f"image-{image_index + 1}",
-                        allowed=_IMAGE_EXTENSIONS,
-                        max_bytes=_MAX_PRODUCT_IMAGE_BYTES,
-                        fallback_ext=".jpg",
-                    )
-                    assets.append(f"brand/assets/products/{slug}/{Path(image_file).name}")
-                    downloaded_product_images += 1
-                except Exception as exc:
-                    logger.warning("Could not materialize Brand Import product image %s: %s", image_url, exc)
-            if assets:
-                product["image_assets"] = assets
-                product_image_assets[product_index] = assets
-        result["product_images"] = product_image_assets
+        for product in products:
+            if isinstance(product, dict):
+                product.pop("image_assets", None)
+                product.pop("image_urls", None)
         return result
 
     def _ensure_wiki_backbone(self, *, name: str) -> None:
@@ -459,7 +413,8 @@ class BrandImportStore:
                 "## Conventions\n\n"
                 "- Use wikilinks between related brand pages.\n"
                 "- Keep generated Brand Import pages under `brand/`.\n"
-                "- Store logo, font, and product image assets under `brand/assets/` and reference files, not base64 data URLs.\n",
+                "- Store binary brand assets in the Myah File Explorer; wiki pages only reference logical paths like `brand/assets/logo.png`.\n"
+                "- Do not persist product images in the wiki; use product URLs for future live product/image context.\n",
             )
         index = self.wiki_root / "index.md"
         entries = [
@@ -585,11 +540,13 @@ class BrandImportStore:
             return {"status": "active", "active": active, "current_job": _annotate_approval_state(job) if job else None}
         return {"status": "empty", "active": None, "current_job": None}
 
-    def approve(self, job_id: str) -> dict[str, Any]:
+    def approve(self, job_id: str, *, file_assets: dict[str, Any] | None = None) -> dict[str, Any]:
         job = self.get_job(job_id)
         if not job:
             raise KeyError(job_id)
         package = job["package"]
+        if file_assets:
+            package["file_assets"] = file_assets
         if approval_blockers(package):
             raise ValueError("brand import needs evidence before approval")
         self.write_brand_brain(package)
@@ -682,10 +639,6 @@ class BrandImportStore:
                 safe_tags = [_safe_text(tag, max_len=80) for tag in tags if _safe_text(tag, max_len=80)]
                 if safe_tags:
                     products_lines.append(f"- Tags: {', '.join(safe_tags)}")
-            for image in product.get("image_urls") or []:
-                products_lines.append(f"- Source image URL: {_safe_text(image, max_len=500)}")
-            for image_asset in product.get("image_assets") or []:
-                products_lines.append(f"- Image file: `{_safe_text(image_asset, max_len=500)}`")
             products_lines.append("")
 
         content_sources = package.get("content_sources") or {}

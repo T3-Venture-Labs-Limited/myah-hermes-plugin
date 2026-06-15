@@ -58,7 +58,7 @@ def test_build_package_prefers_api_catalog_and_uses_scrape_light_for_missing_vis
     assert package["brand"]["typography"]["body"] == "Inter"
     assert package["brand"]["favicon_url"] == "https://glow.example/favicon.ico"
     assert package["products"][0]["title"] == "Serum"
-    assert package["products"][0]["image_urls"] == ["https://cdn/serum.jpg"]
+    assert "image_urls" not in package["products"][0]
     assert package["evidence_summary"]["product_source"] == "shopify_api"
     assert "scrape_light" in package["evidence_summary"]["visual_sources"]
 
@@ -118,22 +118,8 @@ def test_public_storefront_scraper_collects_products_brand_and_visuals_without_s
     assert evidence.warnings == []
 
 
-def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatch, tmp_path):
-    from myah_hermes_plugin.brand_import import storage as storage_mod
-
+def test_approval_references_file_explorer_logo_and_fonts_without_product_images(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
-    fetched = {}
-
-    def fake_fetch_asset(url: str, *, max_bytes: int):
-        fetched[url] = max_bytes
-        payloads = {
-            "https://cdn.glow.test/logo.png": (b"logo-bytes", "image/png"),
-            "https://cdn.glow.test/fonts/lash.woff2": (b"font-bytes", "font/woff2"),
-            "https://cdn.glow.test/products/serum.jpg": (b"serum-image", "image/jpeg"),
-        }
-        return payloads[url]
-
-    monkeypatch.setattr(storage_mod, "_fetch_public_asset", fake_fetch_asset)
 
     start = client.post(
         "/brand/import/start",
@@ -161,17 +147,21 @@ def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatc
     )
     assert start.status_code == 200
 
-    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    approve = client.post(
+        "/brand/import/approve",
+        json={
+            "job_id": start.json()["job_id"],
+            "file_assets": {
+                "logo": {"path": "brand/assets/logo.png", "file_id": "file-logo"},
+                "fonts": [{"path": "brand/assets/fonts/lash.woff2", "file_id": "file-font"}],
+            },
+        },
+    )
     assert approve.status_code == 200
 
     wiki = tmp_path / "wiki"
     brand_dir = wiki / "brand"
-    logo_path = brand_dir / "assets" / "logo.png"
-    font_path = brand_dir / "assets" / "fonts" / "lash.woff2"
-    product_image_path = brand_dir / "assets" / "products" / "lash-serum" / "serum.jpg"
-    assert logo_path.read_bytes() == b"logo-bytes"
-    assert font_path.read_bytes() == b"font-bytes"
-    assert product_image_path.read_bytes() == b"serum-image"
+    assert not (brand_dir / "assets").exists()
 
     active_manifest = json.loads(
         (tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").read_text(encoding="utf-8")
@@ -179,7 +169,8 @@ def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatc
     active_package = active_manifest["package"]
     assert active_package["brand"]["logo_url"] == "brand/assets/logo.png"
     assert active_package["visual_identity"]["font_assets"] == ["brand/assets/fonts/lash.woff2"]
-    assert active_package["products"][0]["image_assets"] == ["brand/assets/products/lash-serum/serum.jpg"]
+    assert "image_urls" not in active_package["products"][0]
+    assert "image_assets" not in active_package["products"][0]
 
     readme = (brand_dir / "README.md").read_text(encoding="utf-8")
     visual = (brand_dir / "visual-system.md").read_text(encoding="utf-8")
@@ -187,17 +178,13 @@ def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatc
     assert "Logo file: `brand/assets/logo.png`" in readme
     assert "Font files:" in visual
     assert "brand/assets/fonts/lash.woff2" in visual
-    assert "Image file: `brand/assets/products/lash-serum/serum.jpg`" in products
-    assert "Source image URL: https://cdn.glow.test/products/serum.jpg" in products
+    assert "URL: https://glow.example/products/lash-serum" in products
+    assert "Image file:" not in products
+    assert "Source image URL:" not in products
     assert "data:image" not in readme + visual + products
-    assert set(fetched) == {
-        "https://cdn.glow.test/logo.png",
-        "https://cdn.glow.test/fonts/lash.woff2",
-        "https://cdn.glow.test/products/serum.jpg",
-    }
 
 
-def test_approval_bounds_remote_asset_downloads_for_large_catalogs(monkeypatch, tmp_path):
+def test_approval_does_not_download_remote_product_images_or_fonts_without_file_refs(monkeypatch, tmp_path):
     from myah_hermes_plugin.brand_import import storage as storage_mod
 
     client = _client(monkeypatch, tmp_path)
@@ -205,9 +192,7 @@ def test_approval_bounds_remote_asset_downloads_for_large_catalogs(monkeypatch, 
 
     def fake_fetch_asset(url: str, *, max_bytes: int):
         fetched.append(url)
-        if "/fonts/" in url:
-            return b"font", "font/woff2"
-        return b"image", "image/jpeg"
+        return b"asset", "image/jpeg"
 
     monkeypatch.setattr(storage_mod, "_fetch_public_asset", fake_fetch_asset)
 
@@ -244,23 +229,17 @@ def test_approval_bounds_remote_asset_downloads_for_large_catalogs(monkeypatch, 
 
     approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
     assert approve.status_code == 200
-
-    fetched_fonts = [url for url in fetched if "/fonts/" in url]
-    fetched_images = [url for url in fetched if "/products/" in url]
-    assert len(fetched_fonts) == storage_mod._MAX_APPROVAL_FONT_ASSETS
-    assert len(fetched_images) == storage_mod._MAX_APPROVAL_PRODUCT_IMAGE_ASSETS
-    assert all(url.endswith("-0.jpg") for url in fetched_images)
-    assert "https://cdn.glow.test/products/product-24-0.jpg" not in fetched_images
+    assert fetched == []
 
     active_manifest = json.loads(
         (tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").read_text(encoding="utf-8")
     )
     active_package = active_manifest["package"]
-    saved_product_assets = [asset for product in active_package["products"] for asset in product.get("image_assets", [])]
-    assert len(saved_product_assets) == storage_mod._MAX_APPROVAL_PRODUCT_IMAGE_ASSETS
+    assert all("image_assets" not in product and "image_urls" not in product for product in active_package["products"])
     products_md = (tmp_path / "wiki" / "brand" / "products.md").read_text(encoding="utf-8")
-    assert "Image file: `brand/assets/products/product-0/product-0-0.jpg`" in products_md
-    assert "Source image URL: https://cdn.glow.test/products/product-29-2.jpg" in products_md
+    assert "Image file:" not in products_md
+    assert "Source image URL:" not in products_md
+    assert "https://glow.example/products/product-29" in products_md
 
 
 def test_public_storefront_scraper_uses_origin_root_for_products_json_when_url_has_path():
@@ -400,7 +379,13 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert edited_package["manual_overrides"]["social_links"] is True
     assert edited_package["manual_overrides"]["products"] is True
 
-    approve = client.post("/brand/import/approve", json={"job_id": job_id})
+    approve = client.post(
+        "/brand/import/approve",
+        json={
+            "job_id": job_id,
+            "file_assets": {"logo": {"path": "brand/assets/approved-logo.png", "file_id": "file-logo"}},
+        },
+    )
     assert approve.status_code == 200
     assert approve.json()["status"] == "active"
 
@@ -411,7 +396,7 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert "[[brand/visual-system]]" in readme
     assert "Logo file: `brand/assets/approved-logo.png`" in readme
     assert "data:image" not in readme
-    assert (wiki / "brand" / "assets" / "approved-logo.png").read_bytes() == b"fake"
+    assert not (wiki / "brand" / "assets" / "approved-logo.png").exists()
     root_index = (wiki / "index.md").read_text(encoding="utf-8")
     assert "[[brand/README]]" in root_index
     assert "[[brand/products]]" in root_index
@@ -462,19 +447,14 @@ def test_active_brand_logo_override_updates_active_manifest_and_brand_kb(monkeyp
     override = client.post(
         "/brand/import/override",
         json={
-            "logo_data_url": "data:image/png;base64,bmV3LWxvZ28=",
-            "logo_filename": "new-logo.png",
+            "logo_url": "brand/assets/new-logo.png",
         },
     )
     assert override.status_code == 200
     assert override.json()["status"] == "active"
     logo_file = override.json()["package"]["brand"]["logo_url"]
-    assert logo_file.endswith("/new-logo.png")
-    assert Path(logo_file).read_bytes() == b"new-logo"
-    assert not logo_file.startswith("data:image/")
-    assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
-    assert override.json()["package"]["manual_overrides"]["logo_filename"] == "new-logo.png"
-    assert override.json()["package"]["manual_overrides"]["logo_file"] == logo_file
+    assert logo_file == "brand/assets/new-logo.png"
+    assert override.json()["package"]["manual_overrides"]["logo_source"] == "manual_url"
 
     active_path = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json"
     active_manifest = json.loads(active_path.read_text(encoding="utf-8"))
@@ -483,7 +463,7 @@ def test_active_brand_logo_override_updates_active_manifest_and_brand_kb(monkeyp
     readme = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
     assert "Logo file: `brand/assets/new-logo.png`" in readme
     assert "data:image" not in readme
-    assert (tmp_path / "wiki" / "brand" / "assets" / "new-logo.png").read_bytes() == b"new-logo"
+    assert not (tmp_path / "wiki" / "brand" / "assets" / "new-logo.png").exists()
     assert "https://cdn/original-logo.svg" not in readme
 
 
@@ -702,18 +682,18 @@ def test_approve_corrupt_job_file_returns_not_found_not_500(monkeypatch, tmp_pat
     assert approve.json()["detail"] == "brand import job not found"
 
 
-def test_malformed_product_images_and_social_links_return_400(monkeypatch, tmp_path):
+def test_malformed_product_image_fields_are_ignored_but_social_links_still_validate(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
 
-    bad_images = client.post(
+    ignored_images = client.post(
         "/brand/import/start",
         json={
             "shop_url": "https://bad.example",
             "api_evidence": {"products": [{"title": "Serum", "images": "https://cdn.example/a.png"}]},
         },
     )
-    assert bad_images.status_code == 400
-    assert bad_images.json()["detail"] == "invalid api_evidence.products[0].images: expected list"
+    assert ignored_images.status_code == 200
+    assert "image_urls" not in ignored_images.json()["package"]["products"][0]
 
     bad_social = client.post(
         "/brand/import/start",

@@ -106,6 +106,7 @@ class BrandImportStartRequest(BaseModel):
 
 class BrandImportApproveRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
+    file_assets: dict[str, Any] | None = None
 
 class BrandImportOverrideRequest(BaseModel):
     job_id: str | None = Field(default=None)
@@ -216,7 +217,7 @@ async def approve_brand_import(
     _auth: None = Depends(require_session_token),
 ) -> dict[str, Any]:
     try:
-        active = BrandImportStore().approve(request.job_id)
+        active = BrandImportStore().approve(request.job_id, file_assets=request.file_assets)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except KeyError:
