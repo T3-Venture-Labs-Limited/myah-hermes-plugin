@@ -107,6 +107,7 @@ elif _hcl_ws is not None:
 from fastapi import APIRouter
 
 from . import (
+    _brand,
     _common,  # noqa: F401  — registered for side effects (sub-routers depend on its module-level singletons)
     _cron_jobs,
     _env,
@@ -114,6 +115,7 @@ from . import (
     _sessions_and_lifecycle,
     _skills_plugins_mcp,
     _soul_and_config,
+    _wiki,
 )
 from ..myah_hook import register_sentry_hook
 
@@ -146,3 +148,5 @@ router.include_router(_providers.router)
 router.include_router(_sessions_and_lifecycle.router)
 router.include_router(_env.router)
 router.include_router(_cron_jobs.router)
+router.include_router(_wiki.router)
+router.include_router(_brand.router)
