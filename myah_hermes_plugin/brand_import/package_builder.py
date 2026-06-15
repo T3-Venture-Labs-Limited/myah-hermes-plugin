@@ -21,6 +21,8 @@ def _first_str(*values: Any) -> str | None:
 
 def _image_urls(product: dict[str, Any], *, field: str) -> list[str]:
     urls: list[str] = []
+    for raw_url in _string_list(product.get("image_urls"), field=f"{field}.image_urls"):
+        urls.append(raw_url)
     for index, image in enumerate(_ensure_list(product.get("images"), field=field)):
         if isinstance(image, dict):
             url = _first_str(image.get("url"), image.get("src"), image.get("originalSrc"))
@@ -30,7 +32,7 @@ def _image_urls(product: dict[str, Any], *, field: str) -> list[str]:
             raise ValueError(f"invalid {field}[{index}]: expected object or string")
         if url:
             urls.append(url)
-    return urls
+    return list(dict.fromkeys(urls))
 
 
 def _ensure_mapping(value: Any, *, field: str) -> dict[str, Any]:
@@ -150,6 +152,7 @@ def build_brand_package(
 
     visual_colors = _string_list(visuals.get("colors"), field="visual_identity.colors")
     visual_fonts = _string_list(visuals.get("fonts"), field="visual_identity.fonts")
+    visual_font_urls = _string_list(visuals.get("font_urls"), field="visual_identity.font_urls")
 
     colors = dict(_ensure_mapping(brand.get("colors"), field="api_evidence.brand.colors"))
     theme_colors = _ensure_mapping(theme_settings.get("colors"), field="theme_evidence.settings.colors")
@@ -197,6 +200,7 @@ def build_brand_package(
         "visual_identity": {
             "colors": visual_colors,
             "fonts": visual_fonts,
+            "font_urls": visual_font_urls,
             "logo_url": logo_url,
             "favicon_url": _first_str(visuals.get("favicon_url")),
         },

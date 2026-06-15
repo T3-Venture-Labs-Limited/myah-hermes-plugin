@@ -9,10 +9,12 @@ import logging
 import re
 import shutil
 import tempfile
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 _JOB_ID_RE = re.compile(r"^brand-[0-9a-f]{12}$")
 _DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", re.DOTALL)
@@ -24,7 +26,18 @@ _IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
     "image/svg+xml": ".svg",
 }
+_FONT_EXTENSIONS = {
+    "font/woff": ".woff",
+    "font/woff2": ".woff2",
+    "application/font-woff": ".woff",
+    "application/font-woff2": ".woff2",
+    "application/x-font-ttf": ".ttf",
+    "font/ttf": ".ttf",
+    "font/otf": ".otf",
+}
 _MAX_LOGO_BYTES = 5_000_000
+_MAX_PRODUCT_IMAGE_BYTES = 8_000_000
+_MAX_FONT_BYTES = 3_000_000
 _MAX_SAFE_TEXT = 120
 logger = logging.getLogger(__name__)
 
@@ -95,6 +108,49 @@ def _write_data_image_asset(data_url: str, filename: Any, assets_dir: Path) -> s
     return str(target)
 
 
+def _is_public_asset_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _fetch_public_asset(url: str, *, max_bytes: int) -> tuple[bytes, str]:
+    from .public_shopify import _validate_public_fetch_url
+
+    _validate_public_fetch_url(url)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MyahBrandImport/1.0 (+https://myah.ai)"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        _validate_public_fetch_url(response.geturl())
+        payload = response.read(max_bytes + 1)
+        content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if not payload or len(payload) > max_bytes:
+        raise ValueError("brand asset exceeds size limit")
+    return payload, content_type
+
+
+def _asset_extension(url: str, content_type: str, allowed: dict[str, str], fallback: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix in set(allowed.values()):
+        return suffix
+    return allowed.get(content_type.lower(), fallback)
+
+
+def _write_remote_asset(url: str, target_dir: Path, *, fallback_name: str, allowed: dict[str, str], max_bytes: int, fallback_ext: str) -> str:
+    payload, content_type = _fetch_public_asset(url, max_bytes=max_bytes)
+    extension = _asset_extension(url, content_type, allowed, fallback_ext)
+    safe_name = _safe_filename(urlparse(url).path, fallback=fallback_name, extension=extension)
+    if Path(safe_name).suffix.lower() not in set(allowed.values()):
+        safe_name = f"{Path(safe_name).stem}{extension}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / safe_name
+    with tempfile.NamedTemporaryFile("wb", dir=target_dir, delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(target)
+    return str(target)
+
+
 def _is_data_image(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("data:image/")
 
@@ -122,6 +178,9 @@ def _safe_product(product: Any) -> dict[str, Any] | None:
     image_urls = _safe_list(product.get("image_urls"), max_items=8, max_len=500)
     if image_urls:
         cleaned["image_urls"] = image_urls
+    image_assets = _safe_list(product.get("image_assets"), max_items=8, max_len=500)
+    if image_assets:
+        cleaned["image_assets"] = image_assets
     return cleaned
 
 
@@ -276,19 +335,92 @@ class BrandImportStore:
         manual["logo_file"] = logo_file
         return logo_file
 
-    def _copy_logo_to_wiki_assets(self, package: dict[str, Any], brand_dir: Path) -> str | None:
-        logo_file = self._materialize_logo_if_needed(package)
-        if not logo_file:
-            return None
-        source = Path(logo_file)
-        if not source.exists() or not source.is_file():
-            return None
+    def _materialize_brand_assets(self, package: dict[str, Any], brand_dir: Path) -> dict[str, Any]:
+        brand = package.setdefault("brand", {})
+        visual_identity = package.setdefault("visual_identity", {})
+        if not isinstance(brand, dict) or not isinstance(visual_identity, dict):
+            return {"logo": None, "fonts": [], "product_images": {}}
+
         assets_dir = brand_dir / "assets"
-        assets_dir.mkdir(parents=True, exist_ok=True)
-        target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix)
-        if source.resolve() != target.resolve():
-            shutil.copyfile(source, target)
-        return f"brand/assets/{target.name}"
+        result: dict[str, Any] = {"logo": None, "fonts": [], "product_images": {}}
+
+        logo_ref = self._materialize_logo_if_needed(package)
+        if logo_ref:
+            try:
+                if _is_public_asset_url(logo_ref):
+                    logo_file = _write_remote_asset(
+                        logo_ref,
+                        assets_dir,
+                        fallback_name="brand-logo",
+                        allowed=_IMAGE_EXTENSIONS,
+                        max_bytes=_MAX_LOGO_BYTES,
+                        fallback_ext=".png",
+                    )
+                else:
+                    source = Path(logo_ref)
+                    if not source.exists() or not source.is_file():
+                        raise FileNotFoundError(str(source))
+                    target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix or ".png")
+                    assets_dir.mkdir(parents=True, exist_ok=True)
+                    if source.resolve() != target.resolve():
+                        shutil.copyfile(source, target)
+                    logo_file = str(target)
+                logo_asset = f"brand/assets/{Path(logo_file).name}"
+                brand["logo_url"] = logo_asset
+                visual_identity["logo_url"] = logo_asset
+                result["logo"] = logo_asset
+            except Exception as exc:
+                logger.warning("Could not materialize Brand Import logo asset %s: %s", logo_ref, exc)
+
+        font_assets: list[str] = []
+        for index, font_url in enumerate(_safe_list(visual_identity.get("font_urls"), max_items=12, max_len=1000)):
+            if not _is_public_asset_url(font_url):
+                continue
+            try:
+                font_file = _write_remote_asset(
+                    font_url,
+                    assets_dir / "fonts",
+                    fallback_name=f"font-{index + 1}",
+                    allowed=_FONT_EXTENSIONS,
+                    max_bytes=_MAX_FONT_BYTES,
+                    fallback_ext=".woff2",
+                )
+                font_assets.append(f"brand/assets/fonts/{Path(font_file).name}")
+            except Exception as exc:
+                logger.warning("Could not materialize Brand Import font asset %s: %s", font_url, exc)
+        if font_assets:
+            visual_identity["font_assets"] = font_assets
+            result["fonts"] = font_assets
+
+        product_image_assets: dict[int, list[str]] = {}
+        products = package.get("products") if isinstance(package.get("products"), list) else []
+        for product_index, product in enumerate(products):
+            if not isinstance(product, dict):
+                continue
+            handle = _safe_text(product.get("handle"), max_len=160)
+            title = _safe_text(product.get("title"), max_len=160) or f"product-{product_index + 1}"
+            slug = _safe_filename(handle or title.lower().replace(" ", "-"), fallback=f"product-{product_index + 1}")
+            assets: list[str] = []
+            for image_index, image_url in enumerate(_safe_list(product.get("image_urls"), max_items=8, max_len=1000)):
+                if not _is_public_asset_url(image_url):
+                    continue
+                try:
+                    image_file = _write_remote_asset(
+                        image_url,
+                        assets_dir / "products" / slug,
+                        fallback_name=f"image-{image_index + 1}",
+                        allowed=_IMAGE_EXTENSIONS,
+                        max_bytes=_MAX_PRODUCT_IMAGE_BYTES,
+                        fallback_ext=".jpg",
+                    )
+                    assets.append(f"brand/assets/products/{slug}/{Path(image_file).name}")
+                except Exception as exc:
+                    logger.warning("Could not materialize Brand Import product image %s: %s", image_url, exc)
+            if assets:
+                product["image_assets"] = assets
+                product_image_assets[product_index] = assets
+        result["product_images"] = product_image_assets
+        return result
 
     def _ensure_wiki_backbone(self, *, name: str) -> None:
         self.wiki_root.mkdir(parents=True, exist_ok=True)
@@ -302,7 +434,7 @@ class BrandImportStore:
                 "## Conventions\n\n"
                 "- Use wikilinks between related brand pages.\n"
                 "- Keep generated Brand Import pages under `brand/`.\n"
-                "- Store image assets under `brand/assets/` and reference files, not base64 data URLs.\n",
+                "- Store logo, font, and product image assets under `brand/assets/` and reference files, not base64 data URLs.\n",
             )
         index = self.wiki_root / "index.md"
         entries = [
@@ -381,7 +513,7 @@ class BrandImportStore:
                 job["updated_at"] = active["updated_at"]
                 _atomic_json_dump(self.jobs_dir / f"{approved_job_id}.json", job)
 
-        self.write_brand_brain(package)
+        self.write_brand_brain(json.loads(json.dumps(package)))
         self.write_brand_style_skill(package)
         return active
 
@@ -454,7 +586,9 @@ class BrandImportStore:
         social_links = _safe_list(brand.get("social_links"), max_items=20, max_len=500)
         product_source = (package.get("evidence_summary") or {}).get("product_source")
         brand_dir.mkdir(parents=True, exist_ok=True)
-        logo_asset = self._copy_logo_to_wiki_assets(package, brand_dir)
+        materialized_assets = self._materialize_brand_assets(package, brand_dir)
+        logo_asset = materialized_assets.get("logo")
+        font_assets = _safe_list((package.get("visual_identity") or {}).get("font_assets"), max_items=12, max_len=500)
         self._ensure_wiki_backbone(name=name)
 
         readme = [
@@ -524,7 +658,9 @@ class BrandImportStore:
                 if safe_tags:
                     products_lines.append(f"- Tags: {', '.join(safe_tags)}")
             for image in product.get("image_urls") or []:
-                products_lines.append(f"- Image: {_safe_text(image, max_len=500)}")
+                products_lines.append(f"- Source image URL: {_safe_text(image, max_len=500)}")
+            for image_asset in product.get("image_assets") or []:
+                products_lines.append(f"- Image file: `{_safe_text(image_asset, max_len=500)}`")
             products_lines.append("")
 
         content_sources = package.get("content_sources") or {}
@@ -570,6 +706,12 @@ class BrandImportStore:
             f"Typography: `{json.dumps(typography, sort_keys=True)}`",
             "",
         ]
+        if font_assets:
+            visual.extend([
+                "Font files:",
+                *(f"- `{asset}`" for asset in font_assets),
+                "",
+            ])
 
         _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
         _atomic_text_write(brand_dir / "products.md", "\n".join(products_lines))

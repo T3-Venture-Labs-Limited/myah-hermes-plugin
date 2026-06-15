@@ -34,6 +34,11 @@ _LINK_RE = re.compile(
     r"<link\s+[^>]*rel=[\"'][^\"']*(?:icon|shortcut icon)[^\"']*[\"'][^>]*href=[\"'](?P<href>[^\"']+)[\"'][^>]*>",
     re.I,
 )
+_FONT_URL_RE = re.compile(r"url\([\"']?(?P<url>[^\"')]+\.(?:woff2?|ttf|otf))(?:\?[^\"')]+)?[\"']?\)", re.I)
+_FONT_LINK_RE = re.compile(
+    r"<link\s+[^>]*(?:as=[\"']font[\"'][^>]*href=[\"'](?P<href1>[^\"']+)[\"']|href=[\"'](?P<href2>[^\"']+\.(?:woff2?|ttf|otf)(?:\?[^\"']*)?)[\"'][^>]*(?:as=[\"']font[\"'])?)[^>]*>",
+    re.I,
+)
 _FONT_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 _SOCIAL_RE = re.compile(r"https?://(?:www\.)?(?:instagram\.com|tiktok\.com|facebook\.com|pinterest\.com|youtube\.com)/[^\"'\s<>]+", re.I)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
@@ -182,6 +187,31 @@ def _fonts(html_text: str) -> list[str]:
     return fonts
 
 
+def _font_urls(html_text: str, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    bounded = html_text[:_MAX_HTML_BYTES]
+    for match in _FONT_URL_RE.finditer(bounded):
+        raw = match.group("url")
+        url = urljoin(base_url.rstrip("/") + "/", raw)
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+        if len(urls) >= 12:
+            return urls
+    for match in _FONT_LINK_RE.finditer(bounded):
+        raw = match.group("href1") or match.group("href2")
+        if not raw:
+            continue
+        url = urljoin(base_url.rstrip("/") + "/", raw)
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+        if len(urls) >= 12:
+            return urls
+    return urls
+
+
 def _images(product: dict[str, Any]) -> list[str]:
     urls: list[str] = []
     images = product.get("images") or []
@@ -278,6 +308,7 @@ def scrape_public_storefront(shop_url: str, *, fetch: FetchFn | None = None) -> 
         "visuals": {
             "colors": colors,
             "fonts": _fonts(html_text),
+            "font_urls": _font_urls(html_text, base_url),
             "logo_url": urljoin(base_url.rstrip("/") + "/", logo) if logo else None,
             "favicon_url": urljoin(base_url.rstrip("/") + "/", favicon) if favicon else None,
         },

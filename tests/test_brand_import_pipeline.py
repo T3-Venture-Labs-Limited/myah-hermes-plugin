@@ -80,7 +80,7 @@ def test_public_storefront_scraper_collects_products_brand_and_visuals_without_s
             <meta property="og:site_name" content="Glow Test">
             <meta property="og:image" content="/cdn/logo.png">
             <link rel="icon" href="/favicon.ico">
-            <style>:root{--brand:#111111;color:#F7E7CE;font-family:'Instrument Serif', Inter, sans-serif;}</style>
+            <style>@font-face{font-family:'Instrument Serif';src:url('/fonts/instrument.woff2') format('woff2');}:root{--brand:#111111;color:#F7E7CE;font-family:'Instrument Serif', Inter, sans-serif;}</style>
             </head><body><a href="https://instagram.com/glowtest">Instagram</a></body></html>''',
         "https://glow.test/products.json?limit=100": json.dumps(
             {
@@ -110,11 +110,91 @@ def test_public_storefront_scraper_collects_products_brand_and_visuals_without_s
     assert evidence.scrape_evidence["visuals"]["favicon_url"] == "https://glow.test/favicon.ico"
     assert "#111111" in evidence.scrape_evidence["visuals"]["colors"]
     assert "Instrument Serif" in evidence.scrape_evidence["visuals"]["fonts"]
+    assert evidence.scrape_evidence["visuals"]["font_urls"] == ["https://glow.test/fonts/instrument.woff2"]
     assert evidence.scrape_evidence["social_links"] == ["https://instagram.com/glowtest"]
     assert evidence.scrape_evidence["products"][0]["title"] == "Lash Serum"
     assert evidence.scrape_evidence["products"][0]["description"] == "Grow healthier lashes."
     assert evidence.public_product_urls == ["https://glow.test/products/lash-serum"]
     assert evidence.warnings == []
+
+
+def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatch, tmp_path):
+    from myah_hermes_plugin.brand_import import storage as storage_mod
+
+    client = _client(monkeypatch, tmp_path)
+    fetched = {}
+
+    def fake_fetch_asset(url: str, *, max_bytes: int):
+        fetched[url] = max_bytes
+        payloads = {
+            "https://cdn.glow.test/logo.png": (b"logo-bytes", "image/png"),
+            "https://cdn.glow.test/fonts/lash.woff2": (b"font-bytes", "font/woff2"),
+            "https://cdn.glow.test/products/serum.jpg": (b"serum-image", "image/jpeg"),
+        }
+        return payloads[url]
+
+    monkeypatch.setattr(storage_mod, "_fetch_public_asset", fake_fetch_asset)
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://glow.example",
+            "scrape_evidence": {
+                "shop": {"name": "Glow Co", "domain": "glow.example"},
+                "visuals": {
+                    "colors": ["#112233"],
+                    "fonts": ["Lash Display"],
+                    "font_urls": ["https://cdn.glow.test/fonts/lash.woff2"],
+                    "logo_url": "https://cdn.glow.test/logo.png",
+                },
+                "products": [
+                    {
+                        "title": "Lash Serum",
+                        "handle": "lash-serum",
+                        "url": "https://glow.example/products/lash-serum",
+                        "description": "Hydrating lash serum.",
+                        "image_urls": ["https://cdn.glow.test/products/serum.jpg"],
+                    }
+                ],
+            },
+        },
+    )
+    assert start.status_code == 200
+
+    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    assert approve.status_code == 200
+
+    wiki = tmp_path / "wiki"
+    brand_dir = wiki / "brand"
+    logo_path = brand_dir / "assets" / "logo.png"
+    font_path = brand_dir / "assets" / "fonts" / "lash.woff2"
+    product_image_path = brand_dir / "assets" / "products" / "lash-serum" / "serum.jpg"
+    assert logo_path.read_bytes() == b"logo-bytes"
+    assert font_path.read_bytes() == b"font-bytes"
+    assert product_image_path.read_bytes() == b"serum-image"
+
+    active_manifest = json.loads(
+        (tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").read_text(encoding="utf-8")
+    )
+    active_package = active_manifest["package"]
+    assert active_package["brand"]["logo_url"] == "brand/assets/logo.png"
+    assert active_package["visual_identity"]["font_assets"] == ["brand/assets/fonts/lash.woff2"]
+    assert active_package["products"][0]["image_assets"] == ["brand/assets/products/lash-serum/serum.jpg"]
+
+    readme = (brand_dir / "README.md").read_text(encoding="utf-8")
+    visual = (brand_dir / "visual-system.md").read_text(encoding="utf-8")
+    products = (brand_dir / "products.md").read_text(encoding="utf-8")
+    assert "Logo file: `brand/assets/logo.png`" in readme
+    assert "Font files:" in visual
+    assert "brand/assets/fonts/lash.woff2" in visual
+    assert "Image file: `brand/assets/products/lash-serum/serum.jpg`" in products
+    assert "Source image URL: https://cdn.glow.test/products/serum.jpg" in products
+    assert "data:image" not in readme + visual + products
+    assert set(fetched) == {
+        "https://cdn.glow.test/logo.png",
+        "https://cdn.glow.test/fonts/lash.woff2",
+        "https://cdn.glow.test/products/serum.jpg",
+    }
 
 
 def test_public_storefront_scraper_uses_origin_root_for_products_json_when_url_has_path():
