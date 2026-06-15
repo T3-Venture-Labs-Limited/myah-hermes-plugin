@@ -139,11 +139,12 @@ def _asset_path_from_record(record: Any) -> str | None:
 
 
 def _fetch_public_asset(url: str, *, max_bytes: int) -> tuple[bytes, str]:
-    from .public_shopify import _validate_public_fetch_url
+    from .public_shopify import _SafeRedirectHandler, _validate_public_fetch_url
 
     _validate_public_fetch_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MyahBrandImport/1.0 (+https://myah.ai)"})
-    with urllib.request.urlopen(req, timeout=15) as response:
+    opener = urllib.request.build_opener(_SafeRedirectHandler)
+    with opener.open(req, timeout=15) as response:
         _validate_public_fetch_url(response.geturl())
         payload = response.read(max_bytes + 1)
         content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
