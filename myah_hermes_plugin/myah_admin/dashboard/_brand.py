@@ -106,7 +106,7 @@ class BrandImportApproveRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
 
 class BrandImportOverrideRequest(BaseModel):
-    job_id: str = Field(..., min_length=1)
+    job_id: str | None = Field(default=None)
     logo_data_url: str | None = None
     logo_filename: str | None = None
     logo_url: str | None = None
@@ -190,10 +190,15 @@ async def override_brand_import(
     overrides = _request_payload(request)
     overrides.pop("job_id", None)
     try:
-        return BrandImportStore().override_review_job(request.job_id, overrides)
+        store = BrandImportStore()
+        if request.job_id:
+            return store.override_review_job(request.job_id, overrides)
+        return store.override_active(overrides)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    except KeyError:
+    except KeyError as exc:
+        if str(exc).strip("'") == "active":
+            raise HTTPException(status_code=404, detail="active brand import not found")
         raise HTTPException(status_code=404, detail="brand import job not found")
 
 

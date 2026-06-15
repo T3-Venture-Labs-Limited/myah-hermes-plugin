@@ -238,6 +238,46 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert manifest["approved_job_id"] == job_id
 
 
+def test_active_brand_logo_override_updates_active_manifest_and_brand_kb(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://glow.example",
+            "api_evidence": {
+                "shop": {"name": "Glow Co", "primary_domain": "glow.example"},
+                "brand": {"logo": {"url": "https://cdn/original-logo.svg"}},
+                "products": [{"title": "Serum", "description": "Hydrating lash serum."}],
+            },
+            "scrape_evidence": {"visuals": {"colors": ["#112233"], "fonts": ["Inter"]}},
+        },
+    )
+    assert start.status_code == 200
+    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    assert approve.status_code == 200
+
+    override = client.post(
+        "/brand/import/override",
+        json={
+            "logo_data_url": "data:image/png;base64,bmV3LWxvZ28=",
+            "logo_filename": "new-logo.png",
+        },
+    )
+    assert override.status_code == 200
+    assert override.json()["status"] == "active"
+    assert override.json()["package"]["brand"]["logo_url"] == "data:image/png;base64,bmV3LWxvZ28="
+    assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
+    assert override.json()["package"]["manual_overrides"]["logo_filename"] == "new-logo.png"
+
+    active_path = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json"
+    active_manifest = json.loads(active_path.read_text(encoding="utf-8"))
+    assert active_manifest["package"]["brand"]["logo_url"] == "data:image/png;base64,bmV3LWxvZ28="
+
+    readme = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
+    assert "Logo URL: data:image/png;base64,bmV3LWxvZ28=" in readme
+    assert "https://cdn/original-logo.svg" not in readme
+
+
 def test_brand_import_start_calls_source_adapter_for_connected_mode(monkeypatch, tmp_path):
     client = _client(monkeypatch, tmp_path)
     seen = {}

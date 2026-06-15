@@ -95,6 +95,40 @@ def _load_json_object(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any]) -> None:
+    brand = package.setdefault("brand", {})
+    if not isinstance(brand, dict):
+        raise ValueError("brand import package has invalid brand data")
+    manual = package.setdefault("manual_overrides", {})
+    if not isinstance(manual, dict):
+        manual = {}
+        package["manual_overrides"] = manual
+    visual_identity = package.setdefault("visual_identity", {})
+    if not isinstance(visual_identity, dict):
+        visual_identity = {}
+        package["visual_identity"] = visual_identity
+
+    if overrides.get("logo_data_url"):
+        logo_data_url = str(overrides["logo_data_url"])
+        if not logo_data_url.startswith("data:image/") or len(logo_data_url) > 2_000_000:
+            raise ValueError("uploaded logo must be an image under 2MB")
+        brand["logo_url"] = logo_data_url
+        visual_identity["logo_url"] = logo_data_url
+        manual["logo_filename"] = _safe_text(overrides.get("logo_filename"), max_len=240)
+        manual["logo_source"] = "uploaded"
+    elif overrides.get("logo_url"):
+        logo_url = _safe_text(overrides.get("logo_url"), max_len=1000)
+        brand["logo_url"] = logo_url
+        visual_identity["logo_url"] = logo_url
+        manual["logo_source"] = "manual_url"
+    if isinstance(overrides.get("typography"), dict):
+        brand["typography"] = {str(k): _safe_text(v, max_len=120) for k, v in overrides["typography"].items() if v}
+        manual["typography"] = True
+    if isinstance(overrides.get("colors"), dict):
+        brand["colors"] = {str(k): _safe_text(v, max_len=40) for k, v in overrides["colors"].items() if v}
+        manual["colors"] = True
+
+
 def _corrupt_job_marker(path: Path) -> dict[str, Any]:
     return {
         "job_id": path.stem,
@@ -149,32 +183,34 @@ class BrandImportStore:
         package = job.get("package")
         if not isinstance(package, dict):
             raise ValueError("brand import job is missing a package")
-        brand = package.setdefault("brand", {})
-        if not isinstance(brand, dict):
-            raise ValueError("brand import package has invalid brand data")
-        manual = package.setdefault("manual_overrides", {})
-        if not isinstance(manual, dict):
-            manual = {}
-            package["manual_overrides"] = manual
-        if overrides.get("logo_data_url"):
-            logo_data_url = str(overrides["logo_data_url"])
-            if not logo_data_url.startswith("data:image/") or len(logo_data_url) > 2_000_000:
-                raise ValueError("uploaded logo must be an image under 2MB")
-            brand["logo_url"] = logo_data_url
-            manual["logo_filename"] = _safe_text(overrides.get("logo_filename"), max_len=240)
-            manual["logo_source"] = "uploaded"
-        elif overrides.get("logo_url"):
-            brand["logo_url"] = _safe_text(overrides.get("logo_url"), max_len=1000)
-            manual["logo_source"] = "manual_url"
-        if isinstance(overrides.get("typography"), dict):
-            brand["typography"] = {str(k): _safe_text(v, max_len=120) for k, v in overrides["typography"].items() if v}
-            manual["typography"] = True
-        if isinstance(overrides.get("colors"), dict):
-            brand["colors"] = {str(k): _safe_text(v, max_len=40) for k, v in overrides["colors"].items() if v}
-            manual["colors"] = True
+        _apply_package_overrides(package, overrides)
         job["updated_at"] = _utc_now()
         _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
         return _annotate_approval_state(job)
+
+    def override_active(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Apply user-supplied overrides to the approved active Brand Brain."""
+        active = self.active()
+        if not active:
+            raise KeyError("active")
+        package = active.get("package")
+        if not isinstance(package, dict):
+            raise ValueError("active brand import manifest is missing a package")
+        _apply_package_overrides(package, overrides)
+        active["updated_at"] = _utc_now()
+        _atomic_json_dump(self.active_path, active)
+
+        approved_job_id = active.get("approved_job_id")
+        if isinstance(approved_job_id, str) and _valid_job_id(approved_job_id):
+            job = self.get_job(approved_job_id)
+            if job and isinstance(job.get("package"), dict):
+                job["package"] = package
+                job["updated_at"] = active["updated_at"]
+                _atomic_json_dump(self.jobs_dir / f"{approved_job_id}.json", job)
+
+        self.write_brand_brain(package)
+        self.write_brand_style_skill(package)
+        return active
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         if not _valid_job_id(job_id):
