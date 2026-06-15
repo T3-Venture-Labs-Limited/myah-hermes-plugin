@@ -197,6 +197,72 @@ def test_approval_materializes_remote_brand_assets_and_links_products(monkeypatc
     }
 
 
+def test_approval_bounds_remote_asset_downloads_for_large_catalogs(monkeypatch, tmp_path):
+    from myah_hermes_plugin.brand_import import storage as storage_mod
+
+    client = _client(monkeypatch, tmp_path)
+    fetched: list[str] = []
+
+    def fake_fetch_asset(url: str, *, max_bytes: int):
+        fetched.append(url)
+        if "/fonts/" in url:
+            return b"font", "font/woff2"
+        return b"image", "image/jpeg"
+
+    monkeypatch.setattr(storage_mod, "_fetch_public_asset", fake_fetch_asset)
+
+    products = []
+    for product_index in range(30):
+        products.append(
+            {
+                "title": f"Product {product_index}",
+                "handle": f"product-{product_index}",
+                "url": f"https://glow.example/products/product-{product_index}",
+                "image_urls": [
+                    f"https://cdn.glow.test/products/product-{product_index}-{image_index}.jpg" for image_index in range(3)
+                ],
+            }
+        )
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "shop_url": "https://glow.example",
+            "scrape_evidence": {
+                "shop": {"name": "Glow Co", "domain": "glow.example"},
+                "visuals": {
+                    "colors": ["#112233"],
+                    "fonts": ["Lash Display"],
+                    "font_urls": [f"https://cdn.glow.test/fonts/font-{index}.woff2" for index in range(12)],
+                    "logo_url": "https://cdn.glow.test/logo.jpg",
+                },
+                "products": products,
+            },
+        },
+    )
+    assert start.status_code == 200
+
+    approve = client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]})
+    assert approve.status_code == 200
+
+    fetched_fonts = [url for url in fetched if "/fonts/" in url]
+    fetched_images = [url for url in fetched if "/products/" in url]
+    assert len(fetched_fonts) == storage_mod._MAX_APPROVAL_FONT_ASSETS
+    assert len(fetched_images) == storage_mod._MAX_APPROVAL_PRODUCT_IMAGE_ASSETS
+    assert all(url.endswith("-0.jpg") for url in fetched_images)
+    assert "https://cdn.glow.test/products/product-24-0.jpg" not in fetched_images
+
+    active_manifest = json.loads(
+        (tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json").read_text(encoding="utf-8")
+    )
+    active_package = active_manifest["package"]
+    saved_product_assets = [asset for product in active_package["products"] for asset in product.get("image_assets", [])]
+    assert len(saved_product_assets) == storage_mod._MAX_APPROVAL_PRODUCT_IMAGE_ASSETS
+    products_md = (tmp_path / "wiki" / "brand" / "products.md").read_text(encoding="utf-8")
+    assert "Image file: `brand/assets/products/product-0/product-0-0.jpg`" in products_md
+    assert "Source image URL: https://cdn.glow.test/products/product-29-2.jpg" in products_md
+
+
 def test_public_storefront_scraper_uses_origin_root_for_products_json_when_url_has_path():
     seen = []
 

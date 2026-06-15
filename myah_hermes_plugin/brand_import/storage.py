@@ -38,6 +38,9 @@ _FONT_EXTENSIONS = {
 _MAX_LOGO_BYTES = 5_000_000
 _MAX_PRODUCT_IMAGE_BYTES = 8_000_000
 _MAX_FONT_BYTES = 3_000_000
+_MAX_APPROVAL_FONT_ASSETS = 4
+_MAX_APPROVAL_PRODUCT_IMAGE_ASSETS = 24
+_MAX_APPROVAL_IMAGES_PER_PRODUCT = 1
 _MAX_SAFE_TEXT = 120
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,10 @@ def _is_public_asset_url(value: Any) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def _is_brand_asset_ref(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("brand/assets/") and ".." not in value.split("/")
+
+
 def _fetch_public_asset(url: str, *, max_bytes: int) -> tuple[bytes, str]:
     from .public_shopify import _validate_public_fetch_url
 
@@ -137,9 +144,16 @@ def _asset_extension(url: str, content_type: str, allowed: dict[str, str], fallb
 
 
 def _write_remote_asset(url: str, target_dir: Path, *, fallback_name: str, allowed: dict[str, str], max_bytes: int, fallback_ext: str) -> str:
+    parsed = urlparse(url)
+    suffix = Path(parsed.path).suffix.lower()
+    if suffix in set(allowed.values()):
+        safe_name = _safe_filename(parsed.path, fallback=fallback_name, extension=suffix)
+        target = target_dir / safe_name
+        if target.exists() and target.is_file():
+            return str(target)
     payload, content_type = _fetch_public_asset(url, max_bytes=max_bytes)
     extension = _asset_extension(url, content_type, allowed, fallback_ext)
-    safe_name = _safe_filename(urlparse(url).path, fallback=fallback_name, extension=extension)
+    safe_name = _safe_filename(parsed.path, fallback=fallback_name, extension=extension)
     if Path(safe_name).suffix.lower() not in set(allowed.values()):
         safe_name = f"{Path(safe_name).stem}{extension}"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -347,25 +361,28 @@ class BrandImportStore:
         logo_ref = self._materialize_logo_if_needed(package)
         if logo_ref:
             try:
-                if _is_public_asset_url(logo_ref):
-                    logo_file = _write_remote_asset(
-                        logo_ref,
-                        assets_dir,
-                        fallback_name="brand-logo",
-                        allowed=_IMAGE_EXTENSIONS,
-                        max_bytes=_MAX_LOGO_BYTES,
-                        fallback_ext=".png",
-                    )
+                if _is_brand_asset_ref(logo_ref):
+                    logo_asset = logo_ref
                 else:
-                    source = Path(logo_ref)
-                    if not source.exists() or not source.is_file():
-                        raise FileNotFoundError(str(source))
-                    target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix or ".png")
-                    assets_dir.mkdir(parents=True, exist_ok=True)
-                    if source.resolve() != target.resolve():
-                        shutil.copyfile(source, target)
-                    logo_file = str(target)
-                logo_asset = f"brand/assets/{Path(logo_file).name}"
+                    if _is_public_asset_url(logo_ref):
+                        logo_file = _write_remote_asset(
+                            logo_ref,
+                            assets_dir,
+                            fallback_name="brand-logo",
+                            allowed=_IMAGE_EXTENSIONS,
+                            max_bytes=_MAX_LOGO_BYTES,
+                            fallback_ext=".png",
+                        )
+                    else:
+                        source = Path(logo_ref)
+                        if not source.exists() or not source.is_file():
+                            raise FileNotFoundError(str(source))
+                        target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix or ".png")
+                        assets_dir.mkdir(parents=True, exist_ok=True)
+                        if source.resolve() != target.resolve():
+                            shutil.copyfile(source, target)
+                        logo_file = str(target)
+                    logo_asset = f"brand/assets/{Path(logo_file).name}"
                 brand["logo_url"] = logo_asset
                 visual_identity["logo_url"] = logo_asset
                 result["logo"] = logo_asset
@@ -373,7 +390,7 @@ class BrandImportStore:
                 logger.warning("Could not materialize Brand Import logo asset %s: %s", logo_ref, exc)
 
         font_assets: list[str] = []
-        for index, font_url in enumerate(_safe_list(visual_identity.get("font_urls"), max_items=12, max_len=1000)):
+        for index, font_url in enumerate(_safe_list(visual_identity.get("font_urls"), max_items=_MAX_APPROVAL_FONT_ASSETS, max_len=1000)):
             if not _is_public_asset_url(font_url):
                 continue
             try:
@@ -394,14 +411,21 @@ class BrandImportStore:
 
         product_image_assets: dict[int, list[str]] = {}
         products = package.get("products") if isinstance(package.get("products"), list) else []
+        downloaded_product_images = 0
         for product_index, product in enumerate(products):
             if not isinstance(product, dict):
                 continue
+            if downloaded_product_images >= _MAX_APPROVAL_PRODUCT_IMAGE_ASSETS:
+                break
             handle = _safe_text(product.get("handle"), max_len=160)
             title = _safe_text(product.get("title"), max_len=160) or f"product-{product_index + 1}"
             slug = _safe_filename(handle or title.lower().replace(" ", "-"), fallback=f"product-{product_index + 1}")
             assets: list[str] = []
-            for image_index, image_url in enumerate(_safe_list(product.get("image_urls"), max_items=8, max_len=1000)):
+            for image_index, image_url in enumerate(
+                _safe_list(product.get("image_urls"), max_items=_MAX_APPROVAL_IMAGES_PER_PRODUCT, max_len=1000)
+            ):
+                if downloaded_product_images >= _MAX_APPROVAL_PRODUCT_IMAGE_ASSETS:
+                    break
                 if not _is_public_asset_url(image_url):
                     continue
                 try:
@@ -414,6 +438,7 @@ class BrandImportStore:
                         fallback_ext=".jpg",
                     )
                     assets.append(f"brand/assets/products/{slug}/{Path(image_file).name}")
+                    downloaded_product_images += 1
                 except Exception as exc:
                     logger.warning("Could not materialize Brand Import product image %s: %s", image_url, exc)
             if assets:
