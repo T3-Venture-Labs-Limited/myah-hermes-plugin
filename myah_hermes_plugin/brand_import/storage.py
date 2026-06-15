@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import re
+import shutil
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +15,16 @@ from pathlib import Path
 from typing import Any
 
 _JOB_ID_RE = re.compile(r"^brand-[0-9a-f]{12}$")
+_DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", re.DOTALL)
+_IMAGE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/svg+xml": ".svg",
+}
+_MAX_LOGO_BYTES = 5_000_000
 _MAX_SAFE_TEXT = 120
 logger = logging.getLogger(__name__)
 
@@ -41,6 +54,49 @@ def _safe_list(values: Any, *, max_items: int, max_len: int = _MAX_SAFE_TEXT) ->
             cleaned.append(text)
             seen.add(text)
     return cleaned
+
+
+def _safe_filename(value: Any, *, fallback: str, extension: str = "") -> str:
+    candidate = Path(str(value or "")).name
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip(".-_")
+    if not candidate:
+        candidate = fallback
+    if not Path(candidate).suffix and extension:
+        candidate = f"{candidate}{extension}"
+    if len(candidate) > 180:
+        suffix = Path(candidate).suffix
+        candidate = candidate[: 180 - len(suffix)] + suffix
+    return candidate
+
+
+def _write_data_image_asset(data_url: str, filename: Any, assets_dir: Path) -> str:
+    match = _DATA_IMAGE_RE.match(data_url or "")
+    if not match:
+        raise ValueError("uploaded logo must be a base64 image data URL")
+    mime_type, encoded = match.groups()
+    extension = _IMAGE_EXTENSIONS.get(mime_type.lower())
+    if not extension:
+        raise ValueError("uploaded logo image type is not supported")
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("uploaded logo is not valid base64") from exc
+    if not payload or len(payload) > _MAX_LOGO_BYTES:
+        raise ValueError("uploaded logo must be an image under 5MB")
+    safe_name = _safe_filename(filename, fallback="brand-logo", extension=extension)
+    if Path(safe_name).suffix.lower() not in set(_IMAGE_EXTENSIONS.values()):
+        safe_name = f"{Path(safe_name).stem}{extension}"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    target = assets_dir / safe_name
+    with tempfile.NamedTemporaryFile("wb", dir=assets_dir, delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(target)
+    return str(target)
+
+
+def _is_data_image(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("data:image/")
 
 
 def _safe_product(product: Any) -> dict[str, Any] | None:
@@ -134,7 +190,7 @@ def _load_json_object(path: Path) -> dict[str, Any] | None:
     return payload
 
 
-def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any]) -> None:
+def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any], *, assets_dir: Path | None = None) -> None:
     brand = package.setdefault("brand", {})
     if not isinstance(brand, dict):
         raise ValueError("brand import package has invalid brand data")
@@ -149,12 +205,14 @@ def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any])
 
     if overrides.get("logo_data_url"):
         logo_data_url = str(overrides["logo_data_url"])
-        if not logo_data_url.startswith("data:image/") or len(logo_data_url) > 2_000_000:
-            raise ValueError("uploaded logo must be an image under 2MB")
-        brand["logo_url"] = logo_data_url
-        visual_identity["logo_url"] = logo_data_url
-        manual["logo_filename"] = _safe_text(overrides.get("logo_filename"), max_len=240)
+        if not assets_dir:
+            raise ValueError("brand import asset directory is required for uploaded logos")
+        logo_file = _write_data_image_asset(logo_data_url, overrides.get("logo_filename"), assets_dir)
+        brand["logo_url"] = logo_file
+        visual_identity["logo_url"] = logo_file
+        manual["logo_filename"] = _safe_filename(overrides.get("logo_filename"), fallback=Path(logo_file).name)
         manual["logo_source"] = "uploaded"
+        manual["logo_file"] = logo_file
     elif overrides.get("logo_url"):
         logo_url = _safe_text(overrides.get("logo_url"), max_len=1000)
         brand["logo_url"] = logo_url
@@ -201,6 +259,70 @@ class BrandImportStore:
         self.jobs_dir = self.root / "jobs"
         self.active_path = self.root / "active.json"
 
+    def _materialize_logo_if_needed(self, package: dict[str, Any]) -> str | None:
+        brand = package.setdefault("brand", {})
+        visual_identity = package.setdefault("visual_identity", {})
+        manual = package.setdefault("manual_overrides", {})
+        if not isinstance(brand, dict) or not isinstance(visual_identity, dict) or not isinstance(manual, dict):
+            return None
+        logo_url = brand.get("logo_url") or visual_identity.get("logo_url")
+        if not _is_data_image(logo_url):
+            return str(logo_url) if logo_url else None
+        filename = manual.get("logo_filename") or "brand-logo"
+        logo_file = _write_data_image_asset(str(logo_url), filename, self.root / "assets")
+        brand["logo_url"] = logo_file
+        visual_identity["logo_url"] = logo_file
+        manual["logo_source"] = "uploaded"
+        manual["logo_file"] = logo_file
+        return logo_file
+
+    def _copy_logo_to_wiki_assets(self, package: dict[str, Any], brand_dir: Path) -> str | None:
+        logo_file = self._materialize_logo_if_needed(package)
+        if not logo_file:
+            return None
+        source = Path(logo_file)
+        if not source.exists() or not source.is_file():
+            return None
+        assets_dir = brand_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        target = assets_dir / _safe_filename(source.name, fallback="brand-logo", extension=source.suffix)
+        if source.resolve() != target.resolve():
+            shutil.copyfile(source, target)
+        return f"brand/assets/{target.name}"
+
+    def _ensure_wiki_backbone(self, *, name: str) -> None:
+        self.wiki_root.mkdir(parents=True, exist_ok=True)
+        schema = self.wiki_root / "SCHEMA.md"
+        if not schema.exists():
+            _atomic_text_write(
+                schema,
+                "# Wiki Schema\n\n"
+                "## Domain\n\n"
+                "This wiki stores Myah-approved brand context for the current agent workspace.\n\n"
+                "## Conventions\n\n"
+                "- Use wikilinks between related brand pages.\n"
+                "- Keep generated Brand Import pages under `brand/`.\n"
+                "- Store image assets under `brand/assets/` and reference files, not base64 data URLs.\n",
+            )
+        index = self.wiki_root / "index.md"
+        entries = [
+            f"- [[brand/README]]: Approved Brand Brain for {name}.",
+            f"- [[brand/products]]: Approved product facts for {name}.",
+            f"- [[brand/visual-system]]: Approved colors, typography, and logo assets for {name}.",
+            f"- [[brand/source-content]]: Source content gathered for {name}.",
+        ]
+        existing = index.read_text(encoding="utf-8") if index.exists() else "# Wiki Index\n\n## Brand\n\n"
+        if "## Brand" not in existing:
+            existing = existing.rstrip() + "\n\n## Brand\n"
+        for entry in entries:
+            if entry.split(':', 1)[0] not in existing:
+                existing = existing.rstrip() + "\n" + entry + "\n"
+        _atomic_text_write(index, existing)
+        log = self.wiki_root / "log.md"
+        existing_log = log.read_text(encoding="utf-8") if log.exists() else "# Wiki Log\n\n"
+        existing_log = existing_log.rstrip() + f"\n\n## [{_utc_now()[:10]}] update | Brand Import approved\n\n- Approved Brand Import for {name}; updated [[brand/README]], [[brand/products]], [[brand/visual-system]], and [[brand/source-content]].\n"
+        _atomic_text_write(log, existing_log)
+
     def _profile_home(self) -> Path:
         # The dashboard process currently runs once from root HERMES_HOME, while
         # per-profile gateways run separately. Brand Import is Creative
@@ -234,7 +356,7 @@ class BrandImportStore:
         package = job.get("package")
         if not isinstance(package, dict):
             raise ValueError("brand import job is missing a package")
-        _apply_package_overrides(package, overrides)
+        _apply_package_overrides(package, overrides, assets_dir=self.root / "assets")
         job["updated_at"] = _utc_now()
         _atomic_json_dump(self.jobs_dir / f"{job_id}.json", job)
         return _annotate_approval_state(job)
@@ -247,7 +369,7 @@ class BrandImportStore:
         package = active.get("package")
         if not isinstance(package, dict):
             raise ValueError("active brand import manifest is missing a package")
-        _apply_package_overrides(package, overrides)
+        _apply_package_overrides(package, overrides, assets_dir=self.root / "assets")
         active["updated_at"] = _utc_now()
         _atomic_json_dump(self.active_path, active)
 
@@ -330,28 +452,57 @@ class BrandImportStore:
         typography = brand.get("typography") or {}
         voice = _safe_text(brand.get("voice"), max_len=500)
         social_links = _safe_list(brand.get("social_links"), max_items=20, max_len=500)
+        product_source = (package.get("evidence_summary") or {}).get("product_source")
+        brand_dir.mkdir(parents=True, exist_ok=True)
+        logo_asset = self._copy_logo_to_wiki_assets(package, brand_dir)
+        self._ensure_wiki_backbone(name=name)
+
         readme = [
-            f"# {name}",
+            "---",
+            f"title: {name} Brand Brain",
+            "type: brand-brain",
+            "tags: [brand, creative-director]",
+            "---",
+            "",
+            f"# {name} Brand Brain",
+            "",
+            "## Navigation",
+            "",
+            "- [[brand/products]]",
+            "- [[brand/visual-system]]",
+            "- [[brand/source-content]]",
             "",
             "## Source summary",
+            "",
             f"- Source mode: `{package.get('source_mode')}`",
             f"- Shop URL: {_safe_text(package.get('shop_url'), max_len=500)}",
-            f"- Product source: `{(package.get('evidence_summary') or {}).get('product_source')}`",
+            f"- Product source: `{product_source}`",
             "",
             "## Brand identity",
+            "",
             f"- Domain: {_safe_text(brand.get('domain'), max_len=240)}",
-            f"- Logo URL: {_safe_text(brand.get('logo_url'), max_len=500)}",
+            f"- Logo file: `{logo_asset}`" if logo_asset else f"- Logo URL: {_safe_text(brand.get('logo_url'), max_len=500)}",
             f"- Favicon URL: {_safe_text(brand.get('favicon_url'), max_len=500)}",
-            f"- Colors: {json.dumps(colors, sort_keys=True)}",
-            f"- Typography: {json.dumps(typography, sort_keys=True)}",
             f"- Voice: {voice}",
             "",
             "## Social links",
+            "",
             *(f"- {link}" for link in social_links),
             "",
         ]
 
-        products_lines = ["# Products", ""]
+        products_lines = [
+            "---",
+            f"title: {name} Products",
+            "type: brand-products",
+            "tags: [brand, products, creative-director]",
+            "---",
+            "",
+            "# Products",
+            "",
+            "Back to [[brand/README]]. Visual context: [[brand/visual-system]].",
+            "",
+        ]
         for index, product in enumerate(package.get("products") or []):
             if not isinstance(product, dict):
                 raise ValueError(f"invalid products[{index}]: expected object")
@@ -377,7 +528,18 @@ class BrandImportStore:
             products_lines.append("")
 
         content_sources = package.get("content_sources") or {}
-        content_lines = ["# Source Content", ""]
+        content_lines = [
+            "---",
+            f"title: {name} Source Content",
+            "type: brand-source-content",
+            "tags: [brand, source-content, creative-director]",
+            "---",
+            "",
+            "# Source Content",
+            "",
+            "Back to [[brand/README]]. Products: [[brand/products]].",
+            "",
+        ]
         for section in ("pages", "policies", "blogs"):
             content_lines.append(f"## {section.title()}")
             for index, item in enumerate(content_sources.get(section) or []):
@@ -391,7 +553,17 @@ class BrandImportStore:
                 content_lines.append("")
 
         visual = [
+            "---",
+            f"title: {name} Visual System",
+            "type: brand-visual-system",
+            "tags: [brand, visual-system, creative-director]",
+            "---",
+            "",
             "# Visual System",
+            "",
+            "Back to [[brand/README]]. Product usage: [[brand/products]].",
+            "",
+            f"Logo file: `{logo_asset}`" if logo_asset else f"Logo URL: `{_safe_text(brand.get('logo_url'), max_len=500)}`",
             "",
             f"Colors: `{json.dumps(colors, sort_keys=True)}`",
             "",
@@ -399,7 +571,6 @@ class BrandImportStore:
             "",
         ]
 
-        brand_dir.mkdir(parents=True, exist_ok=True)
         _atomic_text_write(brand_dir / "README.md", "\n".join(readme))
         _atomic_text_write(brand_dir / "products.md", "\n".join(products_lines))
         _atomic_text_write(brand_dir / "source-content.md", "\n".join(content_lines))

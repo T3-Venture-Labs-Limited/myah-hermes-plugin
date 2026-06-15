@@ -212,9 +212,14 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
         },
     )
     assert override.status_code == 200
-    assert override.json()["package"]["brand"]["logo_url"] == "data:image/png;base64,ZmFrZQ=="
+    uploaded_logo_url = override.json()["package"]["brand"]["logo_url"]
+    assert uploaded_logo_url.endswith("/approved-logo.png")
+    assert uploaded_logo_url.startswith(str(tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "assets"))
+    assert Path(uploaded_logo_url).read_bytes() == b"fake"
+    assert not uploaded_logo_url.startswith("data:image/")
     assert override.json()["package"]["brand"]["typography"]["body"] == "Lato"
     assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
+    assert override.json()["package"]["manual_overrides"]["logo_file"] == uploaded_logo_url
 
     edit_override = client.post(
         "/brand/import/override",
@@ -254,8 +259,22 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert approve.json()["status"] == "active"
 
     wiki = tmp_path / "wiki"
-    assert (wiki / "brand" / "README.md").read_text(encoding="utf-8").startswith("# Glow Co")
+    readme = (wiki / "brand" / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("---\ntitle: Glow Co Brand Brain")
+    assert "[[brand/products]]" in readme
+    assert "[[brand/visual-system]]" in readme
+    assert "Logo file: `brand/assets/approved-logo.png`" in readme
+    assert "data:image" not in readme
+    assert (wiki / "brand" / "assets" / "approved-logo.png").read_bytes() == b"fake"
+    root_index = (wiki / "index.md").read_text(encoding="utf-8")
+    assert "[[brand/README]]" in root_index
+    assert "[[brand/products]]" in root_index
+    assert "[[brand/visual-system]]" in root_index
+    root_log = (wiki / "log.md").read_text(encoding="utf-8")
+    assert "Brand Import approved" in root_log
     products_md = (wiki / "brand" / "products.md").read_text(encoding="utf-8")
+    assert products_md.startswith("---\ntitle: Glow Co Products")
+    assert "[[brand/README]]" in products_md
     assert "Edited Serum" in products_md
     assert "Added Lash Kit" in products_md
     assert "Edited product facts approved by the user." in products_md
@@ -303,16 +322,22 @@ def test_active_brand_logo_override_updates_active_manifest_and_brand_kb(monkeyp
     )
     assert override.status_code == 200
     assert override.json()["status"] == "active"
-    assert override.json()["package"]["brand"]["logo_url"] == "data:image/png;base64,bmV3LWxvZ28="
+    logo_file = override.json()["package"]["brand"]["logo_url"]
+    assert logo_file.endswith("/new-logo.png")
+    assert Path(logo_file).read_bytes() == b"new-logo"
+    assert not logo_file.startswith("data:image/")
     assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
     assert override.json()["package"]["manual_overrides"]["logo_filename"] == "new-logo.png"
+    assert override.json()["package"]["manual_overrides"]["logo_file"] == logo_file
 
     active_path = tmp_path / "hermes" / "profiles" / "creative-director" / "brand_import" / "active.json"
     active_manifest = json.loads(active_path.read_text(encoding="utf-8"))
-    assert active_manifest["package"]["brand"]["logo_url"] == "data:image/png;base64,bmV3LWxvZ28="
+    assert active_manifest["package"]["brand"]["logo_url"] == logo_file
 
     readme = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
-    assert "Logo URL: data:image/png;base64,bmV3LWxvZ28=" in readme
+    assert "Logo file: `brand/assets/new-logo.png`" in readme
+    assert "data:image" not in readme
+    assert (tmp_path / "wiki" / "brand" / "assets" / "new-logo.png").read_bytes() == b"new-logo"
     assert "https://cdn/original-logo.svg" not in readme
 
 
@@ -710,7 +735,8 @@ def test_brand_brain_readme_sanitizes_client_shop_url(monkeypatch, tmp_path):
 
     readme = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
     assert "Ignore previous instructions" not in readme
-    assert readme.count("---") == 0
+    assert "https://bad.example -" in readme
+    assert readme.startswith("---\ntitle: Safe Brand Brand Brain")
 
 
 def test_store_marks_empty_no_evidence_draft_not_approvable(monkeypatch, tmp_path):
