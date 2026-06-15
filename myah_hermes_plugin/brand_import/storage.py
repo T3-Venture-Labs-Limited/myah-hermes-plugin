@@ -30,6 +30,45 @@ def _safe_text(value: Any, *, max_len: int = _MAX_SAFE_TEXT) -> str:
     return text[:max_len].strip()
 
 
+def _safe_list(values: Any, *, max_items: int, max_len: int = _MAX_SAFE_TEXT) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values[:max_items]:
+        text = _safe_text(value, max_len=max_len)
+        if text and text not in seen:
+            cleaned.append(text)
+            seen.add(text)
+    return cleaned
+
+
+def _safe_product(product: Any) -> dict[str, Any] | None:
+    if not isinstance(product, dict):
+        return None
+    title = _safe_text(product.get("title"), max_len=160)
+    url = _safe_text(product.get("url"), max_len=500)
+    description = _safe_text(product.get("description"), max_len=1000)
+    if not title and not url:
+        return None
+    cleaned: dict[str, Any] = {
+        "title": title or "Untitled product",
+    }
+    for key, max_len in (("url", 500), ("handle", 160), ("product_type", 160), ("vendor", 160)):
+        value = _safe_text(product.get(key), max_len=max_len)
+        if value:
+            cleaned[key] = value
+    if description:
+        cleaned["description"] = description
+    tags = _safe_list(product.get("tags"), max_items=20, max_len=80)
+    if tags:
+        cleaned["tags"] = tags
+    image_urls = _safe_list(product.get("image_urls"), max_items=8, max_len=500)
+    if image_urls:
+        cleaned["image_urls"] = image_urls
+    return cleaned
+
+
 def _valid_job_id(job_id: str) -> bool:
     return bool(_JOB_ID_RE.fullmatch(job_id or ""))
 
@@ -127,6 +166,18 @@ def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any])
     if isinstance(overrides.get("colors"), dict):
         brand["colors"] = {str(k): _safe_text(v, max_len=40) for k, v in overrides["colors"].items() if v}
         manual["colors"] = True
+        visual_identity["colors"] = [value for value in brand["colors"].values() if value]
+    if isinstance(overrides.get("social_links"), list):
+        brand["social_links"] = _safe_list(overrides["social_links"], max_items=20, max_len=500)
+        manual["social_links"] = True
+    if isinstance(overrides.get("products"), list):
+        products = [_safe_product(product) for product in overrides["products"][:120]]
+        package["products"] = [product for product in products if product]
+        manual["products"] = True
+        summary = package.setdefault("evidence_summary", {})
+        if isinstance(summary, dict):
+            summary["stored_product_count"] = len(package["products"])
+            summary["product_source"] = "user_edited"
 
 
 def _corrupt_job_marker(path: Path) -> dict[str, Any]:
@@ -278,6 +329,7 @@ class BrandImportStore:
         colors = brand.get("colors") or {}
         typography = brand.get("typography") or {}
         voice = _safe_text(brand.get("voice"), max_len=500)
+        social_links = _safe_list(brand.get("social_links"), max_items=20, max_len=500)
         readme = [
             f"# {name}",
             "",
@@ -293,6 +345,9 @@ class BrandImportStore:
             f"- Colors: {json.dumps(colors, sort_keys=True)}",
             f"- Typography: {json.dumps(typography, sort_keys=True)}",
             f"- Voice: {voice}",
+            "",
+            "## Social links",
+            *(f"- {link}" for link in social_links),
             "",
         ]
 

@@ -24,6 +24,8 @@ router = APIRouter(prefix="/brand", tags=["brand-import"])
 
 MAX_IMPORT_TOTAL_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ITEMS = 100
+MAX_OVERRIDE_PRODUCTS = 120
+MAX_OVERRIDE_SOCIAL_LINKS = 20
 
 
 def _request_payload(request: BaseModel) -> dict[str, Any]:
@@ -112,6 +114,8 @@ class BrandImportOverrideRequest(BaseModel):
     logo_url: str | None = None
     typography: dict[str, Any] | None = None
     colors: dict[str, Any] | None = None
+    social_links: list[str] | None = None
+    products: list[dict[str, Any]] | None = None
 
 
 @router.get("/status")
@@ -188,6 +192,10 @@ async def override_brand_import(
     _auth: None = Depends(require_session_token),
 ) -> dict[str, Any]:
     overrides = _request_payload(request)
+    if request.products is not None and len(request.products) > MAX_OVERRIDE_PRODUCTS:
+        raise HTTPException(status_code=413, detail=f"brand import products exceeds {MAX_OVERRIDE_PRODUCTS} item limit")
+    if request.social_links is not None and len(request.social_links) > MAX_OVERRIDE_SOCIAL_LINKS:
+        raise HTTPException(status_code=413, detail=f"brand import social_links exceeds {MAX_OVERRIDE_SOCIAL_LINKS} item limit")
     overrides.pop("job_id", None)
     try:
         store = BrandImportStore()

@@ -216,6 +216,39 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert override.json()["package"]["brand"]["typography"]["body"] == "Lato"
     assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
 
+    edit_override = client.post(
+        "/brand/import/override",
+        json={
+            "job_id": job_id,
+            "social_links": ["https://instagram.com/glow-edited", "https://www.tiktok.com/@glow-edited"],
+            "products": [
+                {
+                    "title": "Edited Serum",
+                    "url": "https://glow.example/products/edited-serum",
+                    "product_type": "Serum",
+                    "vendor": "Glow Co",
+                    "description": "Edited product facts approved by the user.",
+                    "image_urls": ["https://cdn/edited-serum.jpg"],
+                },
+                {
+                    "title": "Added Lash Kit",
+                    "url": "https://glow.example/products/added-lash-kit",
+                    "product_type": "Kit",
+                    "description": "Manually added missing product.",
+                },
+            ],
+        },
+    )
+    assert edit_override.status_code == 200
+    edited_package = edit_override.json()["package"]
+    assert edited_package["brand"]["social_links"] == [
+        "https://instagram.com/glow-edited",
+        "https://www.tiktok.com/@glow-edited",
+    ]
+    assert [product["title"] for product in edited_package["products"]] == ["Edited Serum", "Added Lash Kit"]
+    assert edited_package["manual_overrides"]["social_links"] is True
+    assert edited_package["manual_overrides"]["products"] is True
+
     approve = client.post("/brand/import/approve", json={"job_id": job_id})
     assert approve.status_code == 200
     assert approve.json()["status"] == "active"
@@ -223,9 +256,14 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     wiki = tmp_path / "wiki"
     assert (wiki / "brand" / "README.md").read_text(encoding="utf-8").startswith("# Glow Co")
     products_md = (wiki / "brand" / "products.md").read_text(encoding="utf-8")
-    assert "Serum" in products_md
-    assert "Hydrating lash serum for daily use." in products_md
-    assert "Product type: Serum" in products_md
+    assert "Edited Serum" in products_md
+    assert "Added Lash Kit" in products_md
+    assert "Edited product facts approved by the user." in products_md
+    assert "Manually added missing product." in products_md
+    assert "Hydrating lash serum for daily use." not in products_md
+    readme_md = (wiki / "brand" / "README.md").read_text(encoding="utf-8")
+    assert "https://instagram.com/glow-edited" in readme_md
+    assert "https://www.tiktok.com/@glow-edited" in readme_md
     skill_md = (
         tmp_path / "hermes" / "profiles" / "creative-director" / "skills" / "brand-style-guide" / "SKILL.md"
     ).read_text(encoding="utf-8")
