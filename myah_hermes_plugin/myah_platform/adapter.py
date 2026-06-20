@@ -2724,6 +2724,10 @@ class MyahAdapter(BasePlatformAdapter):
                 list(self._streams.keys()),
             )
 
+        reflex_result = await self._send_reflex_lifecycle_via_webhook(chat_id, content, meta)
+        if reflex_result.success:
+            return reflex_result
+
         durable_result = await self._send_chat_final_via_webhook(chat_id, content, meta)
         if durable_result.success:
             return durable_result
@@ -2906,6 +2910,100 @@ class MyahAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False,
                 error=f"final-message fallback error: {type(exc).__name__}: {exc}",
+            )
+
+    async def _send_reflex_lifecycle_via_webhook(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Persist a completed Reflex webhook run to the Myah platform."""
+        if not (chat_id or '').startswith('webhook:'):
+            return SendResult(success=False, error=f"No active stream for chat_id={chat_id}")
+
+        parts = (chat_id or '').split(':', 2)
+        if len(parts) != 3:
+            return SendResult(success=False, error=f"Invalid webhook chat_id={chat_id}")
+        _prefix, route_name, delivery_id = parts
+
+        try:
+            from myah_hermes_plugin.myah_admin.dashboard import _webhooks
+            route_config = _webhooks.load_webhook_subscriptions().get(route_name) or {}
+        except Exception:
+            route_config = {}
+        deliver_extra = route_config.get('deliver_extra') if isinstance(route_config, dict) else {}
+        if not isinstance(deliver_extra, dict):
+            deliver_extra = {}
+        reflex_id = (metadata or {}).get('reflex_id') or deliver_extra.get('reflex_id')
+        if not reflex_id:
+            return SendResult(success=False, error=f"Webhook route {route_name} is not a Reflex route")
+
+        base_url = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')
+        bearer = _myah_os.environ.get('MYAH_PLATFORM_BEARER')
+        user_id = _myah_os.environ.get('MYAH_USER_ID', '')
+        if not (base_url and bearer and user_id):
+            return SendResult(success=False, error="Myah Reflex lifecycle env is not configured")
+
+        payload = (metadata or {}).get('payload')
+        if not isinstance(payload, dict):
+            payload = {'route_name': route_name, 'delivery_id': delivery_id}
+
+        headers = {'Authorization': f'Bearer {bearer}'}
+        started_url = f"{base_url.rstrip('/')}/api/v1/reflexes/webhook/run-started"
+        complete_url = f"{base_url.rstrip('/')}/api/v1/reflexes/webhook/run-complete"
+        try:
+            import aiohttp
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                started_payload = {
+                    'reflex_id': reflex_id,
+                    'user_id': user_id,
+                    'chat_id': chat_id,
+                    'payload': payload,
+                }
+                async with session.post(started_url, json=started_payload, headers=headers) as resp:
+                    if not (200 <= resp.status < 300):
+                        body_text = ''
+                        try:
+                            body_text = (await resp.text())[:200]
+                        except Exception:
+                            pass
+                        return SendResult(
+                            success=False,
+                            error=f"reflex run-started returned HTTP {resp.status}: {body_text}",
+                        )
+                    try:
+                        started = await resp.json()
+                    except Exception:
+                        started = {}
+                run_id = started.get('run_id') if isinstance(started, dict) else ''
+                if not run_id:
+                    return SendResult(success=False, error="reflex run-started did not return run_id")
+
+                complete_payload = {
+                    'run_id': run_id,
+                    'user_id': user_id,
+                    'status': 'completed',
+                    'summary': content,
+                    'chat_id': chat_id,
+                }
+                async with session.post(complete_url, json=complete_payload, headers=headers) as resp:
+                    if 200 <= resp.status < 300:
+                        return SendResult(success=True, message_id=run_id)
+                    body_text = ''
+                    try:
+                        body_text = (await resp.text())[:200]
+                    except Exception:
+                        pass
+                    return SendResult(
+                        success=False,
+                        error=f"reflex run-complete returned HTTP {resp.status}: {body_text}",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(
+                success=False,
+                error=f"reflex lifecycle error: {type(exc).__name__}: {exc}",
             )
 
     # ── Myah: Bug D v3 — webhook delivery helper ────────────

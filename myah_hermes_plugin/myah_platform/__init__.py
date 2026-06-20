@@ -21,7 +21,7 @@ import urllib.request
 from typing import Any
 
 from .. import sentry_init
-from ..myah_tools import knowledge_base_tool, secrets_tool
+from ..myah_tools import knowledge_base_tool, secrets_tool, webhook_tool
 from .pre_dispatch_hook import myah_pre_gateway_dispatch
 
 log = logging.getLogger(__name__)
@@ -209,6 +209,40 @@ def _wire_secret_capture_callback() -> None:
     log.info("Myah plugin: registered secret_capture_callback with tools.skills_tool")
 
 
+def _patch_webhook_myah_delivery() -> None:
+    """Let Hermes' generic webhook adapter deliver to plugin platform ``myah``."""
+    try:
+        from gateway.platforms.webhook import WebhookAdapter
+    except Exception:
+        return
+
+    if getattr(WebhookAdapter, '_myah_delivery_patch_installed', False):
+        return
+    original = WebhookAdapter._deliver_cross_platform
+
+    async def _deliver_cross_platform(self, platform_name, content, delivery):
+        if platform_name != 'myah':
+            return await original(self, platform_name, content, delivery)
+        if not self.gateway_runner:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error='No gateway runner for cross-platform delivery')
+        adapter = self.gateway_runner.adapters.get('myah')
+        if adapter is None:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error='Platform myah not connected')
+
+        extra = (delivery or {}).get('deliver_extra') or {}
+        chat_id = extra.get('chat_id') or ''
+        if not chat_id:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error='No chat_id for myah delivery')
+        metadata = {k: v for k, v in extra.items() if k != 'chat_id'} or None
+        return await adapter.send(chat_id, content, metadata=metadata)
+
+    WebhookAdapter._deliver_cross_platform = _deliver_cross_platform
+    WebhookAdapter._myah_delivery_patch_installed = True
+
+
 def register(ctx: Any) -> None:
     """Register Myah platform extensions with the Hermes runtime.
 
@@ -327,6 +361,7 @@ def register(ctx: Any) -> None:
     # If we ever ship multi-tenant in-process, replace this with a
     # contextvar-keyed lookup.
     _wire_secret_capture_callback()
+    _patch_webhook_myah_delivery()
 
     # ── pre_gateway_dispatch hook (Tier 2A Task 2A.4) ──────────────────
     # Replaces skip_user_authorization semantics that PR #20 removed.
@@ -361,6 +396,19 @@ def register(ctx: Any) -> None:
         description=(
             "Securely manage API keys and other credentials without exposing "
             "values to the model."
+        ),
+    )
+
+    # ── Reflex / webhook tool registration ────────────────────────────
+    ctx.register_tool(
+        name="myah_webhook",
+        toolset="hermes-myah",
+        schema=webhook_tool.SCHEMA,
+        handler=webhook_tool.handle,
+        emoji="⚡",
+        description=(
+            "Create and manage Myah Reflexes backed by connected integrations "
+            "and Hermes webhook subscriptions."
         ),
     )
 
