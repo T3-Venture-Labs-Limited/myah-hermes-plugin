@@ -179,3 +179,9 @@ def test_pause_maps_to_reflex_patch(monkeypatch):
 
     assert body["ok"] is True
     assert calls == [("PATCH", "/api/v1/reflexes/rx-1", {"json_body": {"enabled": False}})]
+
+def test_schema_only_advertises_supported_actions():
+    advertised = set(webhook_tool.SCHEMA["parameters"]["properties"]["action"]["enum"])
+    supported = {"list_triggers", "create", "list", "pause", "resume", "delete", "test", "runs"}
+
+    assert advertised == supported

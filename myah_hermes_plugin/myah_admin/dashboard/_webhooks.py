@@ -33,6 +33,13 @@ def _validate_route_name(route_name: str) -> str:
     return route_name
 
 
+def _validate_secret(secret: str | None) -> str:
+    value = (secret or "").strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="secret is required")
+    return value
+
+
 def _subscriptions_path() -> Path:
     # Match upstream hermes_cli.webhook / gateway.platforms.webhook exactly:
     # the webhook adapter hot-reloads this native file on every POST.
@@ -71,16 +78,9 @@ async def subscribe_webhook(route_name: str, body: WebhookSubscribeBody) -> dict
         raise HTTPException(status_code=422, detail="prompt is required")
     if not body.events:
         raise HTTPException(status_code=422, detail="at least one event is required")
+    secret = _validate_secret(body.secret)
 
     subscriptions = load_webhook_subscriptions()
-    existing = subscriptions.get(route_name)
-    if existing:
-        return {
-            "route_name": route_name,
-            "url": existing.get("url") or _webhook_url(route_name),
-            "secret": existing.get("secret"),
-        }
-
     deliver_extra = dict(body.deliver_extra)
     deliver_extra.setdefault("chat_id", f"webhook:{route_name}:myah")
 
@@ -89,7 +89,7 @@ async def subscribe_webhook(route_name: str, body: WebhookSubscribeBody) -> dict
         "url": _webhook_url(route_name),
         "events": body.events,
         "prompt": body.prompt,
-        "secret": body.secret or "",
+        "secret": secret,
         "deliver": body.deliver,
         "deliver_extra": deliver_extra,
     }

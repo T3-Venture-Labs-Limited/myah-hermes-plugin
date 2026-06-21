@@ -177,7 +177,7 @@ SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list_triggers", "create", "list", "update", "pause", "resume", "delete", "test", "runs"],
+                "enum": ["list_triggers", "create", "list", "pause", "resume", "delete", "test", "runs"],
             },
             "reflex_id": {"type": "string"},
             "name": {"type": "string"},

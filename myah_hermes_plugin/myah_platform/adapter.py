@@ -2948,6 +2948,15 @@ class MyahAdapter(BasePlatformAdapter):
         payload = (metadata or {}).get('payload')
         if not isinstance(payload, dict):
             payload = {'route_name': route_name, 'delivery_id': delivery_id}
+        else:
+            payload = dict(payload)
+            payload['route_name'] = route_name
+            payload['delivery_id'] = delivery_id
+            trusted_event_id = (metadata or {}).get('event_id')
+            if trusted_event_id:
+                payload['event_id'] = trusted_event_id
+            else:
+                payload.pop('event_id', None)
 
         headers = {'Authorization': f'Bearer {bearer}'}
         started_url = f"{base_url.rstrip('/')}/api/v1/reflexes/webhook/run-started"

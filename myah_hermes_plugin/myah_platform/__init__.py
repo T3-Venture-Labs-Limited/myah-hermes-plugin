@@ -242,7 +242,12 @@ def _patch_webhook_myah_delivery() -> None:
         if not chat_id:
             from gateway.platforms.base import SendResult
             return SendResult(success=False, error='No chat_id for myah delivery')
-        metadata = {k: v for k, v in extra.items() if k != 'chat_id'} or None
+        metadata = {k: v for k, v in extra.items() if k != 'chat_id'}
+        if isinstance(delivery, dict):
+            for key in ('payload', 'event_id', 'route_name'):
+                if key in delivery:
+                    metadata[key] = delivery[key]
+        metadata = metadata or None
         return await adapter.send(chat_id, content, metadata=metadata)
 
     WebhookAdapter._deliver_cross_platform = _deliver_cross_platform
