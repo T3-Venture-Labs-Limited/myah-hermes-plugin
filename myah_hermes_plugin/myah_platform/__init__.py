@@ -228,6 +228,12 @@ def _patch_webhook_myah_delivery() -> None:
             return SendResult(success=False, error='No gateway runner for cross-platform delivery')
         adapter = self.gateway_runner.adapters.get('myah')
         if adapter is None:
+            try:
+                from gateway.config import Platform
+                adapter = self.gateway_runner.adapters.get(Platform('myah'))
+            except Exception:
+                adapter = None
+        if adapter is None:
             from gateway.platforms.base import SendResult
             return SendResult(success=False, error='Platform myah not connected')
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import WebhookAdapter
 
@@ -42,6 +42,26 @@ async def test_register_patches_webhook_cross_platform_delivery_for_myah():
     webhook = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
     myah = FakeMyahAdapter()
     webhook.gateway_runner = SimpleNamespace(adapters={"myah": myah}, config=SimpleNamespace(get_home_channel=lambda _p: None))
+
+    result = await webhook._deliver_cross_platform(
+        "myah",
+        "Drafted reply",
+        {"deliver_extra": {"chat_id": "webhook:reflex-rx-1:myah", "reflex_id": "rx-1"}},
+    )
+
+    assert result.success is True
+    assert myah.calls == [("webhook:reflex-rx-1:myah", "Drafted reply", {"reflex_id": "rx-1"})]
+
+
+@pytest.mark.asyncio
+async def test_webhook_cross_platform_delivery_finds_platform_keyed_myah_adapter():
+    register(RecordingContext())
+    webhook = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
+    myah = FakeMyahAdapter()
+    webhook.gateway_runner = SimpleNamespace(
+        adapters={Platform("myah"): myah},
+        config=SimpleNamespace(get_home_channel=lambda _p: None),
+    )
 
     result = await webhook._deliver_cross_platform(
         "myah",

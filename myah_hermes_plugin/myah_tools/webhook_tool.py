@@ -34,6 +34,9 @@ def platform_request(method: str, path: str, *, json_body: dict[str, Any] | None
     bearer = _platform_bearer()
     if bearer:
         headers["authorization"] = f"Bearer {bearer}"
+    user_id = (os.environ.get("MYAH_USER_ID") or "").strip()
+    if user_id:
+        headers["x-myah-user-id"] = user_id
 
     req = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
     try:
@@ -78,8 +81,23 @@ def _action_list_triggers(args: dict[str, Any]) -> str:
     if response.get("status") != 200:
         return _error_response("list_triggers", response)
     body = response.get("body")
-    triggers = body if isinstance(body, list) else body.get("triggers", []) if isinstance(body, dict) else []
+    if isinstance(body, list):
+        triggers = body
+    elif isinstance(body, dict):
+        triggers = body.get("items") or body.get("triggers", [])
+    else:
+        triggers = []
     return _ok("list_triggers", triggers=triggers)
+
+
+def _infer_toolkit_slug(args: dict[str, Any]) -> str | None:
+    explicit = str(args.get("toolkit_slug") or "").strip()
+    if explicit:
+        return explicit
+    trigger_slug = str(args.get("trigger_slug") or "").strip()
+    if "_" in trigger_slug:
+        return trigger_slug.split("_", 1)[0].lower()
+    return None
 
 
 def _action_create(args: dict[str, Any]) -> str:
@@ -89,6 +107,7 @@ def _action_create(args: dict[str, Any]) -> str:
         "profile_id": args.get("profile_id") or "default",
         "connected_account_id": args.get("connected_account_id"),
         "trigger_slug": args.get("trigger_slug"),
+        "toolkit_slug": _infer_toolkit_slug(args),
         "trigger_config": args.get("trigger_config") or {},
         "model": args.get("model"),
         "provider": args.get("provider"),
@@ -166,6 +185,7 @@ SCHEMA = {
             "profile_id": {"type": "string"},
             "connected_account_id": {"type": "string"},
             "trigger_slug": {"type": "string"},
+            "toolkit_slug": {"type": "string"},
             "trigger_config": {"type": "object"},
             "model": {"type": "string"},
             "provider": {"type": "string"},
