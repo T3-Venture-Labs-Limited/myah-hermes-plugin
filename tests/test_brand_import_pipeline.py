@@ -346,6 +346,22 @@ def test_brand_import_start_status_and_approve_writes_brand_brain(monkeypatch, t
     assert override.json()["package"]["manual_overrides"]["logo_source"] == "uploaded"
     assert override.json()["package"]["manual_overrides"]["logo_file"] == uploaded_logo_url
 
+    platform_logo_override = client.post(
+        "/brand/import/override",
+        json={
+            "job_id": job_id,
+            "logo_url": "brand/assets/approved-logo.png",
+            "file_assets": {"logo": {"path": "brand/assets/approved-logo.png", "file_id": "file-logo"}},
+        },
+    )
+    assert platform_logo_override.status_code == 200
+    platform_logo_package = platform_logo_override.json()["package"]
+    assert platform_logo_package["brand"]["logo_url"] == "brand/assets/approved-logo.png"
+    assert platform_logo_package["file_assets"]["logo"] == {
+        "path": "brand/assets/approved-logo.png",
+        "file_id": "file-logo",
+    }
+
     edit_override = client.post(
         "/brand/import/override",
         json={
@@ -596,6 +612,177 @@ def test_brand_import_manual_evidence_is_threaded_to_package(monkeypatch, tmp_pa
     assert package["brand"]["name"] == "Manual Brand"
     assert package["brand"]["voice"] == "plainspoken and confident"
     assert package["visual_identity"]["colors"] == ["#123456"]
+
+
+def test_remove_active_brand_clears_plugin_owned_state_but_not_file_explorer_refs(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "manual_evidence": {
+                "brand_name": "Manual Brand",
+                "voice": "friendly ecommerce operator",
+                "visual_identity": {"colors": ["#123456"], "fonts": ["Inter"]},
+            },
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+    approve = client.post(
+        "/brand/import/approve",
+        json={"job_id": job_id, "file_assets": {"logo": {"path": "brand/assets/logo.png", "file_id": "file-logo"}}},
+    )
+    assert approve.status_code == 200
+
+    hermes_profile = tmp_path / "hermes" / "profiles" / "creative-director"
+    brand_root = hermes_profile / "brand_import"
+    active_path = brand_root / "active.json"
+    jobs_dir = brand_root / "jobs"
+    skill_dir = hermes_profile / "skills" / "brand-style-guide"
+    wiki_brand_dir = tmp_path / "wiki" / "brand"
+
+    assert active_path.is_file()
+    assert (jobs_dir / f"{job_id}.json").is_file()
+    assert (skill_dir / "SKILL.md").is_file()
+    assert (wiki_brand_dir / "README.md").is_file()
+    assert (wiki_brand_dir / "products.md").is_file()
+    assert (wiki_brand_dir / "source-content.md").is_file()
+    assert (wiki_brand_dir / "visual-system.md").is_file()
+    assert approve.json()["package"]["brand"]["logo_url"] == "brand/assets/logo.png"
+    asset_file = wiki_brand_dir / "assets" / "logo.png"
+    asset_file.parent.mkdir(parents=True, exist_ok=True)
+    asset_file.write_bytes(b"platform-owned-logo")
+
+    result = BrandImportStore().remove_active_brand()
+
+    assert result == {"status": "empty", "removed": True}
+    assert BrandImportStore().status() == {"status": "empty", "active": None, "current_job": None}
+    assert not active_path.exists()
+    assert not jobs_dir.exists()
+    assert not (wiki_brand_dir / "README.md").exists()
+    assert not (wiki_brand_dir / "products.md").exists()
+    assert not (wiki_brand_dir / "source-content.md").exists()
+    assert not (wiki_brand_dir / "visual-system.md").exists()
+    assert not skill_dir.exists()
+    # File Explorer assets live in the platform database/storage layer. The
+    # plugin only removes its generated wiki/skill/state references.
+    assert asset_file.read_bytes() == b"platform-owned-logo"
+    log_path = tmp_path / "wiki" / "log.md"
+    log_text = log_path.read_text(encoding="utf-8")
+    assert log_text.count("Brand Import removed") == 1
+
+    assert BrandImportStore().remove_active_brand() == {"status": "empty", "removed": False}
+    assert log_path.read_text(encoding="utf-8").count("Brand Import removed") == 1
+
+
+def test_remove_active_brand_is_idempotent_when_nothing_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "wiki"))
+
+    result = BrandImportStore().remove_active_brand()
+
+    assert result == {"status": "empty", "removed": False}
+    assert BrandImportStore().status() == {"status": "empty", "active": None, "current_job": None}
+
+
+def test_remove_brand_route_clears_active_brand_and_is_idempotent(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    start = client.post("/brand/import/start", json={"manual_evidence": {"brand_name": "Route Brand"}})
+    assert start.status_code == 200
+    assert client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]}).status_code == 200
+
+    first = client.delete("/brand")
+    assert first.status_code == 200
+    assert first.json() == {"status": "empty", "removed": True}
+    assert client.get("/brand/status").json() == {"status": "empty", "active": None, "current_job": None}
+
+    second = client.delete("/brand")
+    assert second.status_code == 200
+    assert second.json() == {"status": "empty", "removed": False}
+
+
+def test_remove_brand_route_enforces_session_token_when_configured(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WEB_SESSION_TOKEN", "secret-token")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "wiki"))
+    app = FastAPI()
+    app.include_router(_brand.router)
+    client = TestClient(app)
+
+    assert client.delete("/brand").status_code == 401
+    assert client.delete("/brand", headers={"X-Hermes-Session-Token": "secret-token"}).status_code == 200
+
+
+def test_active_brand_product_and_social_overrides_rewrite_brand_brain(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    start = client.post(
+        "/brand/import/start",
+        json={
+            "manual_evidence": {"brand_name": "Editable Brand"},
+            "scrape_evidence": {"products": [{"title": "Original", "url": "https://brand.test/products/original"}]},
+        },
+    )
+    assert start.status_code == 200
+    assert client.post("/brand/import/approve", json={"job_id": start.json()["job_id"]}).status_code == 200
+
+    override = client.post(
+        "/brand/import/override",
+        json={
+            "social_links": ["https://instagram.com/editable", "https://www.tiktok.com/@editable"],
+            "products": [
+                {
+                    "id": "gid://shopify/Product/123",
+                    "title": "Edited Product",
+                    "handle": "edited-product",
+                    "url": "https://brand.test/products/edited",
+                    "product_type": "Bundle",
+                    "vendor": "Editable Brand",
+                    "description": "Edited by the user in Settings.",
+                    "source": "user_edited",
+                    "tags": ["bundle", "manual"],
+                }
+            ],
+        },
+    )
+
+    assert override.status_code == 200
+    package = override.json()["package"]
+    assert package["brand"]["social_links"] == ["https://instagram.com/editable", "https://www.tiktok.com/@editable"]
+    assert [product["title"] for product in package["products"]] == ["Edited Product"]
+    assert package["products"][0]["id"] == "gid://shopify/Product/123"
+    assert package["products"][0]["handle"] == "edited-product"
+    assert package["products"][0]["source"] == "user_edited"
+    assert package["products"][0]["tags"] == ["bundle", "manual"]
+    assert package["manual_overrides"]["social_links"] is True
+    assert package["manual_overrides"]["products"] is True
+    assert package["evidence_summary"]["product_source"] == "user_edited"
+
+    products_md = (tmp_path / "wiki" / "brand" / "products.md").read_text(encoding="utf-8")
+    readme_md = (tmp_path / "wiki" / "brand" / "README.md").read_text(encoding="utf-8")
+    assert "Edited Product" in products_md
+    assert "Edited by the user in Settings." in products_md
+    assert "Original" not in products_md
+    assert "https://instagram.com/editable" in readme_md
+    assert "https://www.tiktok.com/@editable" in readme_md
+
+
+def test_brand_import_override_rejects_oversized_product_and_social_lists(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+
+    too_many_products = client.post(
+        "/brand/import/override",
+        json={"products": [{"title": f"Product {index}"} for index in range(_brand.MAX_OVERRIDE_PRODUCTS + 1)]},
+    )
+    assert too_many_products.status_code == 413
+    assert too_many_products.json()["detail"] == f"brand import products exceeds {_brand.MAX_OVERRIDE_PRODUCTS} item limit"
+
+    too_many_socials = client.post(
+        "/brand/import/override",
+        json={"social_links": [f"https://social.example/{index}" for index in range(_brand.MAX_OVERRIDE_SOCIAL_LINKS + 1)]},
+    )
+    assert too_many_socials.status_code == 413
+    assert too_many_socials.json()["detail"] == f"brand import social_links exceeds {_brand.MAX_OVERRIDE_SOCIAL_LINKS} item limit"
 
 
 def test_malformed_nested_evidence_returns_400_instead_of_500(monkeypatch, tmp_path):

@@ -197,7 +197,7 @@ def _safe_product(product: Any) -> dict[str, Any] | None:
     cleaned: dict[str, Any] = {
         "title": title or "Untitled product",
     }
-    for key, max_len in (("url", 500), ("handle", 160), ("product_type", 160), ("vendor", 160)):
+    for key, max_len in (("id", 200), ("url", 500), ("handle", 160), ("product_type", 160), ("vendor", 160), ("source", 80)):
         value = _safe_text(product.get(key), max_len=max_len)
         if value:
             cleaned[key] = value
@@ -286,6 +286,23 @@ def _apply_package_overrides(package: dict[str, Any], overrides: dict[str, Any],
     if not isinstance(visual_identity, dict):
         visual_identity = {}
         package["visual_identity"] = visual_identity
+
+    if isinstance(overrides.get("file_assets"), dict):
+        file_assets = package.setdefault("file_assets", {})
+        if not isinstance(file_assets, dict):
+            file_assets = {}
+            package["file_assets"] = file_assets
+        logo_asset = overrides["file_assets"].get("logo")
+        logo_path = _asset_path_from_record(logo_asset)
+        if logo_path:
+            file_assets["logo"] = logo_asset
+        font_assets = [
+            record
+            for record in (overrides["file_assets"].get("fonts") or [])[:_MAX_APPROVAL_FONT_ASSETS]
+            if _asset_path_from_record(record)
+        ]
+        if font_assets:
+            file_assets["fonts"] = font_assets
 
     if overrides.get("logo_data_url"):
         logo_data_url = str(overrides["logo_data_url"])
@@ -497,6 +514,71 @@ class BrandImportStore:
         self.write_brand_brain(json.loads(json.dumps(package)))
         self.write_brand_style_skill(package)
         return active
+
+    def remove_active_brand(self) -> dict[str, Any]:
+        """Remove plugin-owned Brand Brain state and generated guidance.
+
+        File Explorer assets created by the Myah platform are intentionally not
+        touched here. The plugin owns the JSON review state, generated wiki
+        `brand/` pages, and generated `brand-style-guide` skill only.
+        """
+        removed = False
+        targets = [
+            self.root,
+            self.profile_home / "skills" / "brand-style-guide",
+        ]
+        for target in targets:
+            if not target.exists():
+                continue
+            removed = True
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+
+        brand_dir = self.wiki_root / "brand"
+        for filename in ("README.md", "products.md", "source-content.md", "visual-system.md"):
+            generated_page = brand_dir / filename
+            if generated_page.exists():
+                removed = True
+                generated_page.unlink()
+        if brand_dir.exists():
+            try:
+                next(brand_dir.iterdir())
+            except StopIteration:
+                removed = True
+                brand_dir.rmdir()
+
+        index = self.wiki_root / "index.md"
+        if index.exists():
+            lines = index.read_text(encoding="utf-8").splitlines()
+            filtered = [
+                line
+                for line in lines
+                if not any(
+                    link in line
+                    for link in (
+                        "[[brand/README]]",
+                        "[[brand/products]]",
+                        "[[brand/visual-system]]",
+                        "[[brand/source-content]]",
+                    )
+                )
+            ]
+            if filtered != lines:
+                removed = True
+                _atomic_text_write(index, "\n".join(filtered).rstrip() + "\n")
+
+        log = self.wiki_root / "log.md"
+        if removed and log.exists():
+            existing_log = log.read_text(encoding="utf-8")
+            existing_log = existing_log.rstrip() + (
+                f"\n\n## [{_utc_now()[:10]}] update | Brand Import removed\n\n"
+                "- Removed active Brand Import state and generated brand pages.\n"
+            )
+            _atomic_text_write(log, existing_log)
+
+        return {"status": "empty", "removed": removed}
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         if not _valid_job_id(job_id):

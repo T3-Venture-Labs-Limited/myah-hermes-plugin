@@ -113,6 +113,7 @@ class BrandImportOverrideRequest(BaseModel):
     logo_data_url: str | None = None
     logo_filename: str | None = None
     logo_url: str | None = None
+    file_assets: dict[str, Any] | None = None
     typography: dict[str, Any] | None = None
     colors: dict[str, Any] | None = None
     social_links: list[str] | None = None
@@ -122,6 +123,11 @@ class BrandImportOverrideRequest(BaseModel):
 @router.get("/status")
 async def brand_status(_auth: None = Depends(require_session_token)) -> dict[str, Any]:
     return BrandImportStore().status()
+
+
+@router.delete("")
+async def remove_brand(_auth: None = Depends(require_session_token)) -> dict[str, Any]:
+    return BrandImportStore().remove_active_brand()
 
 
 @router.post("/import/start")
