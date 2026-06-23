@@ -20,6 +20,7 @@ Why loopback instead of importing handler functions directly:
 
 from __future__ import annotations
 
+import os
 import logging
 from typing import Any
 
@@ -28,8 +29,30 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-_DASHBOARD_BASE = 'http://localhost:9119'
+_DEFAULT_DASHBOARD_PORT = '9119'
 _TIMEOUT_SECONDS = 15.0
+
+
+def _dashboard_base() -> str:
+    """Return the dashboard loopback base URL for native /api/* calls.
+
+    The dashboard normally runs on 9119, but local Myah worktrees often run
+    isolated dashboards on per-branch ports. The plugin executes inside the
+    dashboard process, so it can safely use a loopback URL; the port just needs
+    to follow the process env instead of being hard-coded.
+    """
+    explicit = os.environ.get('HERMES_DASHBOARD_LOOPBACK_URL', '').strip()
+    if explicit:
+        return explicit.rstrip('/')
+
+    host = os.environ.get('HERMES_DASHBOARD_LOOPBACK_HOST', '127.0.0.1').strip() or '127.0.0.1'
+    port = (
+        os.environ.get('HERMES_DASHBOARD_PORT')
+        or os.environ.get('HERMES_WEB_PORT')
+        or os.environ.get('MYAH_HERMES_WEB_PORT')
+        or _DEFAULT_DASHBOARD_PORT
+    )
+    return f'http://{host}:{str(port).strip() or _DEFAULT_DASHBOARD_PORT}'
 
 
 async def proxy_to_native(
@@ -52,7 +75,7 @@ async def proxy_to_native(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(
                 method,
-                f'{_DASHBOARD_BASE}{path}',
+                f'{_dashboard_base()}{path}',
                 json=json_body,
                 params=params,
                 headers=headers,

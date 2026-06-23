@@ -55,7 +55,7 @@ async def test_proxy_forwards_get_with_session_token(monkeypatch):
     fake_token = 'tok-fixture-abc'
     _install_fake_web_server(monkeypatch, fake_token)
 
-    with respx.mock(base_url='http://localhost:9119') as mock:
+    with respx.mock(base_url='http://127.0.0.1:9119') as mock:
         route = mock.get('/api/tools/toolsets').mock(
             return_value=Response(200, json=[{'name': 'browser'}]),
         )
@@ -71,7 +71,7 @@ async def test_proxy_forwards_get_with_session_token(monkeypatch):
 async def test_proxy_forwards_put_with_json_body(monkeypatch):
     _install_fake_web_server(monkeypatch, 'tok-1')
 
-    with respx.mock(base_url='http://localhost:9119') as mock:
+    with respx.mock(base_url='http://127.0.0.1:9119') as mock:
         route = mock.put('/api/config').mock(
             return_value=Response(200, json={'ok': True}),
         )
@@ -92,7 +92,7 @@ async def test_proxy_raises_on_4xx_with_native_body(monkeypatch):
     with the same status code + body."""
     _install_fake_web_server(monkeypatch, 'tok-1')
 
-    with respx.mock(base_url='http://localhost:9119') as mock:
+    with respx.mock(base_url='http://127.0.0.1:9119') as mock:
         mock.get('/api/skills').mock(
             return_value=Response(404, json={'detail': 'Not found'}),
         )
@@ -108,12 +108,30 @@ async def test_proxy_503_on_connection_error(monkeypatch):
     """If the dashboard isn't reachable, proxy returns 503 (not 500)."""
     _install_fake_web_server(monkeypatch, 'tok-1')
 
-    with respx.mock(base_url='http://localhost:9119') as mock:
+    with respx.mock(base_url='http://127.0.0.1:9119') as mock:
         mock.get('/api/tools/toolsets').mock(side_effect=httpx.ConnectError('refused'))
         with pytest.raises(HTTPException) as excinfo:
             await _proxy_module.proxy_to_native('GET', '/api/tools/toolsets')
 
     assert excinfo.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_proxy_uses_dashboard_port_from_env(monkeypatch):
+    """Local worktrees run dashboard on non-default ports; loopback must follow env."""
+    _install_fake_web_server(monkeypatch, 'tok-1')
+    monkeypatch.setenv('HERMES_DASHBOARD_PORT', '9121')
+
+    with respx.mock(base_url='http://127.0.0.1:9121') as mock:
+        route = mock.post('/api/providers/oauth/openai-codex/start').mock(
+            return_value=Response(200, json={'session_id': 'sess-1'}),
+        )
+        result = await _proxy_module.proxy_to_native(
+            'POST', '/api/providers/oauth/openai-codex/start'
+        )
+
+    assert result == {'session_id': 'sess-1'}
+    assert route.called
 
 
 def test_session_token_import_path_exists_or_documents_environment():
