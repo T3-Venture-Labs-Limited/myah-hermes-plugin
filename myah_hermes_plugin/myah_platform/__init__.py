@@ -283,6 +283,20 @@ def register(ctx: Any) -> None:
     # (which only see agent.telemetry.TelemetryHook) route through it.
     sentry_init.setup_sentry()
 
+    # ── Replicate image generation backend ───────────────────────────────
+    # Myah's hosted Creative Director defaults use Replicate via Hermes'
+    # ImageGenProvider registry. Register the provider from the already-enabled
+    # myah-platform plugin so profile config can safely select
+    # image_gen.provider: replicate once the provider-bearing image is pinned.
+    try:
+        from myah_hermes_plugin.image_gen.replicate import ReplicateImageGenProvider
+
+        if hasattr(ctx, "register_image_gen_provider"):
+            ctx.register_image_gen_provider(ReplicateImageGenProvider())
+    except Exception:
+        log.exception("Failed to register Replicate image generation provider")
+    # ────────────────────────────────────────────────────────────────────
+
     # ── Sentry observability hooks (Phase 2) ───────────────────────────
     # Register pre/post_api_request + pre/post_tool_call hooks that emit
     # Myah-context breadcrumbs alongside the OpenAIIntegration's raw
