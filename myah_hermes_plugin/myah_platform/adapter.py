@@ -32,6 +32,7 @@ import logging
 import re
 import time
 import uuid
+from urllib.parse import parse_qs, unquote, urlparse
 from typing import Any, Dict, Optional
 
 try:
@@ -167,6 +168,20 @@ def _clean_observability_id(value: str) -> Optional[str]:
 # ────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
+
+_SHOPIFY_AUTH_URL_RE = re.compile(r'https://(?:accounts\.)?shopify\.com/[^\s"<>]+', re.IGNORECASE)
+_LOCALHOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _cli_auth_ports_from_login_url(login_url: str) -> list[int]:
+    query = parse_qs(urlparse(login_url).query)
+    ports: set[int] = set()
+    for raw_value in query.get("redirect_uri", []) + query.get("redirect_url", []) + query.get("callback_url", []):
+        callback = urlparse(unquote(raw_value))
+        if callback.hostname in _LOCALHOSTS and callback.port:
+            ports.add(callback.port)
+    return sorted(ports)
+
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -319,6 +334,9 @@ class MyahAdapter(BasePlatformAdapter):
         "clarify.resolved",
         "secret.required",
         "secret.resolved",
+        "cli_auth.required",
+        "cli_auth.resolved",
+        "cli_auth.failed",
         "reasoning.delta",
         "reasoning.available",
         "status",
@@ -391,6 +409,9 @@ class MyahAdapter(BasePlatformAdapter):
 
         # Pending secret captures: stream_id → { event: threading.Event, result: dict }
         self._pending_secrets: Dict[str, Dict] = {}
+        # stream_id → auth_id → provider/allowed port metadata emitted by cli_auth.required.
+        # This is the authority for callback relay; request bodies are never trusted for ports.
+        self._pending_cli_auth: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # Pending clarify prompts: stream_id → clarify_id → metadata. The
         # blocking primitive lives in upstream tools.clarify_gateway; this map
         # lets the HTTP endpoint validate stream/request ownership before
@@ -547,6 +568,27 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── SSE helpers ─────────────────────────────────────────────────────
 
+    def _remember_cli_auth_event(self, stream_id: str, event: Dict[str, Any]) -> None:
+        """Track CLI-auth prompts so callback relay cannot be client-authorized."""
+        event_type = event.get("event")
+        auth_id = str(event.get("auth_id") or "").strip()
+        if not auth_id:
+            return
+        if event_type == "cli_auth.required":
+            raw_ports = event.get("allowed_callback_ports") or []
+            ports = sorted({port for port in raw_ports if isinstance(port, int) and 1 <= port <= 65535})
+            provider = str(event.get("provider") or "").strip()
+            self._pending_cli_auth.setdefault(stream_id, {})[auth_id] = {
+                "provider": provider,
+                "allowed_callback_ports": ports,
+            }
+        elif event_type in {"cli_auth.resolved", "cli_auth.failed"}:
+            pending = self._pending_cli_auth.get(stream_id)
+            if pending is not None:
+                pending.pop(auth_id, None)
+                if not pending:
+                    self._pending_cli_auth.pop(stream_id, None)
+
     def _push_event(self, stream_id: str, event: Dict[str, Any]) -> None:
         """Thread-safe push of an event dict to a stream's queue.
 
@@ -558,6 +600,7 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        self._remember_cli_auth_event(stream_id, event)
         if event.get("event") in self.CONTENTFUL_STREAM_EVENTS:
             self._stream_had_content.add(stream_id)
         try:
@@ -570,6 +613,7 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        self._remember_cli_auth_event(stream_id, event)
         # Track that a user-visible content event was delivered for this
         # stream so the suppression-bug workaround in _dispatch_message's
         # finally can distinguish "real failure with no output" from
@@ -1290,6 +1334,98 @@ class MyahAdapter(BasePlatformAdapter):
                 self._native_streaming_used.discard(session_key)
                 self._stream_delta_invoked.discard(session_key)
                 self._stream_had_content.discard(stream_id)
+                self._pending_cli_auth.pop(stream_id, None)
+
+
+    def _validate_cli_auth_callback_payload(
+        self, stream_id: str, body: Dict[str, Any]
+    ) -> tuple[str, str, str, list[int]]:
+        """Validate a platform-submitted browser OAuth callback relay payload.
+
+        The request body supplies only identifiers and the callback URL. The
+        allowed callback ports come from the previously emitted cli_auth.required
+        event, not from the client request, so a compromised browser cannot turn
+        this endpoint into a loopback SSRF gadget.
+        """
+        auth_id = str(body.get("auth_id") or "").strip()
+        provider = str(body.get("provider") or "").strip()
+        callback_url = str(body.get("callback_url") or "").strip()
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", auth_id):
+            raise ValueError("Invalid auth_id")
+        if provider != "shopify":
+            raise ValueError("Unsupported CLI auth provider")
+
+        pending = self._pending_cli_auth.get(stream_id, {}).get(auth_id)
+        if pending is None:
+            raise ValueError("No pending CLI auth session for this auth_id")
+        if pending.get("provider") != provider:
+            raise ValueError("CLI auth provider does not match pending session")
+        ports = pending.get("allowed_callback_ports") or []
+
+        parsed = urlparse(callback_url)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("callback_url must target localhost")
+        if parsed.port is None or parsed.port not in ports:
+            raise ValueError("callback_url port is not allowed for this auth session")
+        return auth_id, provider, callback_url, ports
+
+    async def _handle_cli_auth_callback_endpoint(self, request: "web.Request") -> "web.Response":
+        """POST /myah/v1/cli-auth/{stream_id}/callback — relay OAuth callback to local CLI listener."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        stream_id = request.match_info.get("stream_id", "")
+        if stream_id not in self._streams:
+            return web.json_response({"error": "No active stream for CLI auth callback"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        try:
+            auth_id, provider, callback_url, _ports = self._validate_cli_auth_callback_payload(stream_id, body)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        timeout = _myah_aiohttp.ClientTimeout(total=10)
+        try:
+            async with _myah_aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(callback_url, allow_redirects=False) as resp:
+                    status = resp.status
+        except Exception as exc:
+            self._push_event_sync(stream_id, {
+                "event": "cli_auth.failed",
+                "stream_id": stream_id,
+                "run_id": stream_id,
+                "timestamp": time.time(),
+                "auth_id": auth_id,
+                "provider": provider,
+                "error": str(exc),
+            })
+            return web.json_response({"error": "Failed to relay CLI auth callback"}, status=502)
+
+        if 200 <= status < 400:
+            self._push_event_sync(stream_id, {
+                "event": "cli_auth.resolved",
+                "stream_id": stream_id,
+                "run_id": stream_id,
+                "timestamp": time.time(),
+                "auth_id": auth_id,
+                "provider": provider,
+            })
+            return web.json_response({"ok": True, "status": status})
+
+        self._push_event_sync(stream_id, {
+            "event": "cli_auth.failed",
+            "stream_id": stream_id,
+            "run_id": stream_id,
+            "timestamp": time.time(),
+            "auth_id": auth_id,
+            "provider": provider,
+            "error": f"CLI callback listener returned HTTP {status}",
+        })
+        return web.json_response({"error": "CLI callback listener rejected callback", "status": status}, status=502)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
@@ -1946,6 +2082,7 @@ class MyahAdapter(BasePlatformAdapter):
             # activity. They should keep the stream from degrading to the
             # gateway-suppression fallback after /steer or long tool-only
             # phases where no assistant text has streamed yet.
+            self._remember_cli_auth_event(stream_id, event_data)
             if event_data.get("event") in self.CONTENTFUL_STREAM_EVENTS:
                 self._stream_had_content.add(stream_id)
             try:
@@ -1993,6 +2130,9 @@ class MyahAdapter(BasePlatformAdapter):
             _put(self._format_tool_complete_event(
                 stream_id, tool_call_id, function_name, tool_args, result
             ))
+            cli_auth_event = self._extract_cli_auth_required_event(stream_id, result)
+            if cli_auth_event is not None:
+                _put(cli_auth_event)
 
         def _reasoning(text):
             if not text:
@@ -2023,6 +2163,35 @@ class MyahAdapter(BasePlatformAdapter):
             "tool_complete_callback": _tool_complete,
             "reasoning": _reasoning,
             "status": _status,
+        }
+
+
+    @staticmethod
+    def _extract_cli_auth_required_event(stream_id: str, result: Any) -> dict | None:
+        """Detect Shopify CLI browser-auth output and emit a pending auth event."""
+        if not isinstance(result, str):
+            result = str(result)
+        match = _SHOPIFY_AUTH_URL_RE.search(result or "")
+        if not match:
+            return None
+        login_url = match.group(0).rstrip(").,]")
+        parsed = urlparse(login_url)
+        if parsed.scheme != "https" or parsed.hostname not in {"accounts.shopify.com", "shopify.com", "partners.shopify.com"}:
+            return None
+        ports = _cli_auth_ports_from_login_url(login_url)
+        if not ports:
+            return None
+        digest = uuid.uuid5(uuid.NAMESPACE_URL, f"{stream_id}\n{login_url}").hex[:16]
+        return {
+            "event": "cli_auth.required",
+            "stream_id": stream_id,
+            "run_id": stream_id,
+            "timestamp": time.time(),
+            "auth_id": f"shopify-{digest}",
+            "provider": "shopify",
+            "login_url": login_url,
+            "allowed_callback_ports": ports,
+            "help": "Open the Shopify login URL in your browser, then paste the localhost callback URL back into Myah.",
         }
 
     @staticmethod
@@ -2355,6 +2524,7 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
         app.router.add_post("/myah/v1/clarify/{stream_id}", self._handle_clarify_endpoint)
         app.router.add_post("/myah/v1/secret/{stream_id}", self._handle_secret_endpoint)
+        app.router.add_post("/myah/v1/cli-auth/{stream_id}/callback", self._handle_cli_auth_callback_endpoint)
         app.router.add_get("/myah/v1/media", self._handle_media_get)  # Myah: media endpoint
         # ── Myah: aux router HTTP wrapper ────────────────────────────────
         app.router.add_post('/myah/v1/aux/{task}', self._handle_aux_endpoint)
