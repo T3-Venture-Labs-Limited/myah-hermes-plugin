@@ -102,6 +102,11 @@ def _resolve_model() -> str:
     return DEFAULT_MODEL
 
 
+def _is_replicate_configured_provider() -> bool:
+    cfg = _load_image_gen_config()
+    return str(cfg.get("provider") or "").strip() == "replicate"
+
+
 def _model_aspect_ratio(model_id: str, aspect_ratio: str) -> str:
     aspect = resolve_aspect_ratio(aspect_ratio)
     meta = _MODELS.get(model_id) or _MODELS[DEFAULT_MODEL]
@@ -187,6 +192,55 @@ def _broker_bearer() -> str:
     ).strip()
 
 
+def _replicate_api_token() -> str:
+    token = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        from hermes_cli.config import get_env_value
+
+        return (get_env_value("REPLICATE_API_TOKEN") or "").strip()
+    except Exception as exc:
+        logger.debug("Could not read REPLICATE_API_TOKEN from Hermes env: %s", exc)
+        return ""
+
+
+def _request_replicate_api_token() -> str:
+    """Ask the active Myah chat surface for only the Replicate BYOK token.
+
+    This deliberately does not generalize provider secret capture. The current
+    product path is Replicate BYOK for image generation; broader environment
+    variable setup belongs in a separate, explicit feature.
+    """
+    try:
+        from tools import skills_tool
+    except Exception as exc:
+        logger.debug("Replicate BYOK prompt unavailable; skills_tool import failed: %s", exc)
+        return ""
+
+    callback = getattr(skills_tool, "_secret_capture_callback", None)
+    if not callable(callback):
+        return ""
+
+    try:
+        result = callback(
+            "REPLICATE_API_TOKEN",
+            "Connect Replicate to generate images. Paste your Replicate API token.",
+            {
+                "help": "https://replicate.com/account/api-tokens",
+                "skill_name": "Replicate image generation",
+                "required_for": "Replicate image generation",
+            },
+        )
+    except Exception:
+        logger.warning("Replicate BYOK secret capture failed", exc_info=True)
+        return ""
+
+    if not isinstance(result, dict) or not result.get("success") or result.get("skipped"):
+        return ""
+    return _replicate_api_token()
+
+
 class ReplicateImageGenProvider(ImageGenProvider):
     """Replicate-backed image generation provider."""
 
@@ -199,7 +253,7 @@ class ReplicateImageGenProvider(ImageGenProvider):
         return "Replicate"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("REPLICATE_API_TOKEN") or _broker_url())
+        return bool(_replicate_api_token() or _broker_url() or _is_replicate_configured_provider())
 
     def list_models(self) -> list[dict[str, Any]]:
         return [
@@ -314,12 +368,14 @@ class ReplicateImageGenProvider(ImageGenProvider):
         )
 
     def _generate_direct(self, prompt: str, aspect: str, model_id: str) -> Dict[str, Any]:
-        token = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+        token = _replicate_api_token()
+        if not token:
+            token = _request_replicate_api_token()
         if not token:
             return error_response(
                 error=(
-                    "Replicate image generation is not configured. Set REPLICATE_API_TOKEN "
-                    "or configure the hosted Myah Replicate image broker."
+                    "Replicate image generation is not configured. Connect Replicate by adding "
+                    "REPLICATE_API_TOKEN, or configure the hosted Myah Replicate image broker."
                 ),
                 error_type="auth_required",
                 provider=self.name,

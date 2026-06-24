@@ -57,6 +57,19 @@ def test_provider_availability_accepts_direct_token_or_hosted_broker(monkeypatch
     assert provider.is_available() is True
 
 
+
+def test_provider_availability_accepts_explicit_replicate_config_for_byok_prompt(monkeypatch):
+    import myah_hermes_plugin.image_gen.replicate as replicate
+
+    monkeypatch.delenv('REPLICATE_API_TOKEN', raising=False)
+    monkeypatch.delenv('MYAH_REPLICATE_IMAGE_BROKER_URL', raising=False)
+    monkeypatch.setattr(replicate, '_load_image_gen_config', lambda: {'provider': 'replicate'})
+
+    assert replicate.ReplicateImageGenProvider().is_available() is True
+
+    monkeypatch.setattr(replicate, '_load_image_gen_config', lambda: {})
+    assert replicate.ReplicateImageGenProvider().is_available() is False
+
 def test_setup_schema_prompts_for_replicate_token():
     from myah_hermes_plugin.image_gen.replicate import ReplicateImageGenProvider
 
@@ -212,3 +225,36 @@ def test_missing_credentials_do_not_fall_back_to_fal(monkeypatch):
     assert result['success'] is False
     assert result['error_type'] == 'auth_required'
     assert 'FAL' not in result['error'].upper()
+
+def test_missing_direct_token_prompts_for_replicate_byok_only(monkeypatch):
+    import tools.skills_tool as skills_tool
+    import myah_hermes_plugin.image_gen.replicate as replicate
+
+    captured = {}
+
+    def fake_secret_callback(name, prompt, metadata):
+        captured['name'] = name
+        captured['prompt'] = prompt
+        captured['metadata'] = metadata
+        monkeypatch.setenv('REPLICATE_API_TOKEN', 'r8_prompted_secret')
+        return {'success': True, 'skipped': False, 'stored_as': name}
+
+    def fake_post_json(url, payload, headers, timeout):
+        captured['url'] = url
+        captured['headers'] = headers
+        return {'id': 'pred-123', 'status': 'succeeded', 'output': 'https://replicate.delivery/pbxt/out.png'}
+
+    monkeypatch.delenv('REPLICATE_API_TOKEN', raising=False)
+    monkeypatch.delenv('MYAH_REPLICATE_IMAGE_BROKER_URL', raising=False)
+    monkeypatch.setattr(skills_tool, '_secret_capture_callback', fake_secret_callback)
+    monkeypatch.setattr(replicate, '_post_json', fake_post_json)
+    monkeypatch.setattr(replicate, 'save_url_image', lambda url, prefix: '/tmp/replicate_prompted.png')
+
+    result = replicate.ReplicateImageGenProvider().generate('make a product ad')
+
+    assert result['success'] is True
+    assert captured['name'] == 'REPLICATE_API_TOKEN'
+    assert 'Replicate' in captured['prompt']
+    assert captured['metadata']['help'] == 'https://replicate.com/account/api-tokens'
+    assert captured['headers']['Authorization'] == 'Bearer r8_prompted_secret'
+    assert 'r8_prompted_secret' not in str(result)
