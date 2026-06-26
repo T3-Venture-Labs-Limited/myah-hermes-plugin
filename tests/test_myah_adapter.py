@@ -359,6 +359,107 @@ class TestSendMethods:
         assert result.success is False
 
     @pytest.mark.asyncio
+    async def test_send_image_file_suppresses_live_chat_fallback_text(self, monkeypatch):
+        """Local image files should not become duplicate transcript text.
+
+        Hermes' base adapter falls back to sending image files as ordinary
+        text (``Image: <path>`` with an emoji prefix). Myah renders generated
+        media through artifact cards, so the fallback text duplicates the
+        same image in the chat transcript.
+        """
+        from myah_hermes_plugin.myah_platform.adapter import SendResult
+
+        adapter = _make_adapter()
+        q = asyncio.Queue()
+        stream_id = "stream-image-file-test"
+        adapter._chat_id_streams["chat-image"] = stream_id
+        adapter._streams[stream_id] = q
+
+        send_spy = AsyncMock(return_value=SendResult(success=True, message_id="unexpected-send"))
+        monkeypatch.setattr(adapter, "send", send_spy)
+
+        result = await adapter.send_image_file("chat-image", "/tmp/generated.png")
+
+        assert result.success is True
+        assert result.message_id == "suppressed-image-file-fallback"
+        send_spy.assert_not_called()
+        assert q.empty()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_preserves_caption_without_image_path(self, monkeypatch):
+        """Captions remain visible while the duplicate file-path fallback is suppressed."""
+        from myah_hermes_plugin.myah_platform.adapter import SendResult
+
+        adapter = _make_adapter()
+        stream_id = "stream-image-caption-test"
+        adapter._chat_id_streams["chat-caption"] = stream_id
+        adapter._streams[stream_id] = asyncio.Queue()
+
+        send_spy = AsyncMock(return_value=SendResult(success=True, message_id="caption-send"))
+        monkeypatch.setattr(adapter, "send", send_spy)
+
+        result = await adapter.send_image_file(
+            "chat-caption",
+            "/tmp/generated-with-caption.png",
+            caption="Here is the final option.",
+        )
+
+        assert result.success is True
+        assert result.message_id == "caption-send"
+        send_spy.assert_awaited_once_with(
+            chat_id="chat-caption",
+            content="Here is the final option.",
+            reply_to=None,
+            metadata=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_suppresses_live_chat_with_incidental_origin_metadata(self, monkeypatch):
+        """A generic origin field on a live turn must not defeat suppression."""
+        from myah_hermes_plugin.myah_platform.adapter import SendResult
+
+        adapter = _make_adapter()
+        stream_id = "stream-image-origin-test"
+        adapter._chat_id_streams["chat-origin"] = stream_id
+        adapter._streams[stream_id] = asyncio.Queue()
+
+        send_spy = AsyncMock(return_value=SendResult(success=True, message_id="unexpected-send"))
+        monkeypatch.setattr(adapter, "send", send_spy)
+
+        result = await adapter.send_image_file(
+            "chat-origin",
+            "/tmp/generated-origin.png",
+            metadata={"origin": "creative-director"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "suppressed-image-file-fallback"
+        send_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_delegates_non_live_chat_paths(self, monkeypatch):
+        """Cron/offline deliveries still use the base fallback persistence path."""
+        from myah_hermes_plugin.myah_platform.adapter import SendResult
+
+        adapter = _make_adapter()
+        send_spy = AsyncMock(return_value=SendResult(success=True, message_id="delegated-send"))
+        monkeypatch.setattr(adapter, "send", send_spy)
+
+        result = await adapter.send_image_file(
+            "chat-cron-image",
+            "/tmp/cron-image.png",
+            metadata={"job_id": "cron123"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "delegated-send"
+        send_spy.assert_awaited_once()
+        sent_kwargs = send_spy.await_args.kwargs
+        assert sent_kwargs["chat_id"] == "chat-cron-image"
+        assert sent_kwargs["metadata"] == {"job_id": "cron123"}
+        assert "/tmp/cron-image.png" in sent_kwargs["content"]
+
+    @pytest.mark.asyncio
     async def test_send_typing_pushes_status(self):
         adapter = _make_adapter()
         q = asyncio.Queue()
