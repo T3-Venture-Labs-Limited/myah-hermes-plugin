@@ -2671,6 +2671,64 @@ class MyahAdapter(BasePlatformAdapter):
 
         logger.info("[%s] Myah adapter disconnected", self.name)
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Suppress Hermes' text fallback for live Myah web-chat images.
+
+        ``BasePlatformAdapter.send_image_file()`` falls back to normal text
+        delivery for platforms without native attachment support. In Myah's
+        web chat, generated media is already delivered through structured
+        artifact output, so the inherited fallback would stream and persist a
+        second transcript line containing the local image path.
+
+        Keep non-live paths on the base implementation so cron/offline
+        deliveries still flow through the existing ``send()`` persistence
+        logic. Preserve captions as ordinary text; only the duplicate file
+        path fallback is suppressed.
+        """
+        meta = dict(metadata) if metadata else {}
+        has_cron_signal = bool(
+            meta.get("job_id")
+            or meta.get("thread_id")
+            or meta.get("job_name")
+            or meta.get("ran_at")
+            or _recover_cron_job_id_from_session_key()
+        )
+        stream_id = self._chat_id_streams.get(chat_id) if chat_id else None
+        is_live_chat_stream = bool(stream_id and stream_id in self._streams)
+
+        if is_live_chat_stream and not has_cron_signal:
+            # The image path itself is intentionally discarded here. Myah's
+            # generated-media artifact is the authoritative image delivery
+            # surface; this branch only preserves optional prose captions.
+            if caption:
+                return await self.send(
+                    chat_id=chat_id,
+                    content=caption,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return SendResult(
+                success=True,
+                message_id="suppressed-image-file-fallback",
+            )
+
+        return await super().send_image_file(
+            chat_id=chat_id,
+            image_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
+
     async def send(
         self,
         chat_id: str,
